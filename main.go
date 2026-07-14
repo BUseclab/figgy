@@ -44,6 +44,8 @@ import (
 
 // GOAL - trace all exec related syscalls
 
+// ======================================== start of STEP 2 FUNCTIONS ========================================
+
 // HEKPER FUNC: get process name
 func procName(pid int) string {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
@@ -52,6 +54,10 @@ func procName(pid int) string {
 	}
 	return strings.TrimSpace(string(b)) // bytes-->string
 }
+
+// ======================================== end of STEP 2 FUNCTIONS ========================================
+
+// ======================================== start of STEP 3 FUNCTIONS ========================================
 
 // HELPER FUNC: reads 1 8-byte word out of TRACEE'S memory addr
 func readWord(pid int, addr uintptr) (uint64, bool) { // retval: 8byte word, true/false - success/fail
@@ -99,6 +105,52 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 	}
 	return out, count
 }
+
+// ======================================== end of STEP 3 FUNCTIONS ========================================
+
+// ======================================== start of STEP 4 FUNCTIONS ========================================
+
+// modifies the argv command and returns success/unsuccess + the new argv command
+func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
+	newArgv := make([]string, len(ogArgv))
+	copy(newArgv, ogArgv)
+	
+	// modifies the value after the flag passed in
+	for i := 0; i < len(newArgv); i++ {
+		a := newArgv[i]
+		if (a == flagName) {
+			if (i+1 >= len(newArgv)) {
+				return false, nil
+			}
+			newArgv[i+1] = newArgv[i+1] + ".v2"
+			return true, newArgv
+		}
+	}
+
+	return false, nil
+}
+
+func runModifiedCmd(pid int, path string, newArgv, env []string) {
+	c := exec.Command(path)
+	c.Args = newArgv
+	c.Env = env
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout 
+	c.Stderr = os.Stderr 
+
+	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))  // go to targets cwd
+	
+	if (err == nil) {
+		c.Dir = cwd
+	}
+
+	err = c.Run()
+	if (err != nil) {
+		fmt.Printf("	duplicate run failed: %v\n", err)
+	}
+}
+
+// ======================================== end of STEP 4 FUNCTIONS ========================================
 
 func main() {
 	fmt.Printf("Number argc args: %d\n", len(os.Args))
@@ -181,16 +233,22 @@ func main() {
 					// ORIGINAL (first cmd) --- gcc -c file.c -o file.o
 					// MODIFIED (new cmd) ----- gcc -c file.c -o file.o.v2
 					fmt.Println("exec syscall entered")
-					if (len(os.Args) > 2 && os.Args[2] != "") {
-						prog2 := exec.Command(os.Args[2])
-						prog2.Stdin = os.Stdin
-						prog2.Stdout = os.Stdout
-						prog2.Stderr = os.Stderr
-						err = prog2.Run()
-						if err != nil {
-							fmt.Printf("program failed: %v\n", err)
+
+					if (strings.HasSuffix(path, "gcc")) {  // checks for cmd ending w/ gcc
+						present, newArgv := modifyArgvCmd(argv, "-o")
+						if (present) {
+							fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
+							runModifiedCmd(pid, path, newArgv, envv)
 						}
 					}
+
+					/* TODOODODO NEXT STEP
+					./main make
+
+					./main -- make
+					./main --modify -- make -j 8
+					./main --no-modify -- make
+					*/
 				}
 				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
 				// fmt.Printf("[%s pid %d] hit syscall id: %d\n", procName(childPid), childPid, regs.Orig_rax)
@@ -204,8 +262,4 @@ func main() {
 			syscall.PtraceSyscall(pid, int(sig))
 		}
 	}
-
-	
-	// prog2 := exec.Command("./bye")
-	
 }

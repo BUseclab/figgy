@@ -6,7 +6,7 @@ int main(void) {
     char *argv[] = {NULL};
     char *envp[] = {NULL};
     
-    execve("./write", argv, envp);  // should run writer too
+    execve("/usr/bin/make", argv, envp);  // should run writer too
     
     _exit(1);  // only reached if execve fails
 }
