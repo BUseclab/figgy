@@ -113,7 +113,10 @@ func main() {
 
 	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
 
-	cmd := exec.Command(os.Args[1])
+	name := os.Args[1]
+	args := os.Args[2:]
+
+	cmd := exec.Command(name, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
