@@ -1,5 +1,5 @@
 # Makefile_Interposer
 
 NOTE TO SELF
-- to test system call tracing, change `cmd := exec.Command(os.Args[1])` to `cmd := exec.Command("./testExecve")`
-- then rebuild main.go and then run it as normal
+- to run the test files, the cmd format must be `./main ./[compiled c file name]`
+    - e.g. `./main ./write`
