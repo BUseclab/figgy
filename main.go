@@ -15,9 +15,10 @@ import (
 
 //1. (DONE) fork build process
 //2. (DONE) trace syscall - need to trace all forks/clones
-//3. (TEST) parse/interpret args from syscall out of tracee memory
-//4. () modify command (replace args in tracee memory by modifying registers)
-//	-4.1. SIDENOTE - right now focus on argv modification, can expand to envp modification ltr
+//3. (DONE) parse/interpret args from syscall out of tracee memory
+//4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
+//	- SIDENOTE - right now focus on argv modification, can expand to envp modification ltr
+// 	- 3 Cases: Same/Lesser/Greater # of argv's
 //5. () resume the process
 
 // Find actual arguments (execve args)
@@ -112,9 +113,7 @@ func main() {
 
 	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
 
-	// TODO: instead of hardcoding cmd, just pass it in as a parameter -- easier
 	cmd := exec.Command(os.Args[1])
-	// cmd := exec.Command("./testExecve")  // -------------------- TESTING LINE TESTING LINE TESTING LINE --------------------
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
