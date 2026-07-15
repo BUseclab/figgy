@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"flag"
 )
 
 //1. (DONE) fork build process
@@ -19,7 +20,7 @@ import (
 //4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
 //	- SIDENOTE - right now focus on argv modification, can expand to envp modification ltr
 // 	- 3 Cases: Same/Lesser/Greater # of argv's
-//5. () resume the process
+//5. (DONE) resume the process
 
 // Find actual arguments (execve args)
 // execve signature: int execve(const char *pathname, char *const argv[], char *const envp[]);
@@ -44,7 +45,77 @@ import (
 
 // GOAL - trace all exec related syscalls
 
-// ======================================== start of STEP 2 FUNCTIONS ========================================
+// ======================================== start of STEP 1 FUNCTIONS ========================================  //
+
+// parses the flags + commands (args) from the user command
+func parseArgs(args []string) (bool, []string, bool) {
+	fs := flag.NewFlagSet("main", flag.ContinueOnError)
+
+	modify := fs.Bool("modify", false, "run only v2 cmd, don't run og")
+	// noModify := fs.Bool("no-modify", true, "run both og and v2 cmd")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: main [--modify] -- <cmd> [args...]")
+		fs.PrintDefaults()
+	}
+
+	err := fs.Parse(args)
+	if (err != nil) {
+		return false, nil, false
+	}
+
+	command := fs.Args()
+	if (len(command) == 0) {
+		fs.Usage()
+		return false, nil, false
+	}
+
+	return *modify, command, true
+}
+
+/*func parseArgs(args []string) (bool, []string, bool) {
+	modify := false
+	var command []string
+
+	sep := -1
+	for i, a := range args {
+		if (a == "--") {
+			sep = i
+			break
+		}
+	}
+
+	var flags []string
+	if (sep == -1) {
+		command = args
+	} else {	
+		flags = args[:sep]
+		command = args[sep+1:]
+	}
+
+	for _, f := range flags {
+		switch f {
+			case "--modify":
+				modify = true
+			case "--no-modify":
+				modify = false
+			default:
+				fmt.Printf("unknown flag: %s\n", f)
+				return false, nil, false
+		}		
+	}
+
+	if (len(command) == 0) {
+		fmt.Println("no command to trace (usage: ./main [--modify|--no-modify] -- <cmd> [args...])")
+		return false, nil, false
+	}
+
+	return modify, command, true
+}*/
+
+// ======================================== end of STEP 1 FUNCTIONS ======================================== //
+
+// ======================================== start of STEP 2 FUNCTIONS ======================================== //
 
 // HEKPER FUNC: get process name
 func procName(pid int) string {
@@ -55,9 +126,9 @@ func procName(pid int) string {
 	return strings.TrimSpace(string(b)) // bytes-->string
 }
 
-// ======================================== end of STEP 2 FUNCTIONS ========================================
+// ======================================== end of STEP 2 FUNCTIONS ======================================== //
 
-// ======================================== start of STEP 3 FUNCTIONS ========================================
+// ======================================== start of STEP 3 FUNCTIONS ======================================== //
 
 // HELPER FUNC: reads 1 8-byte word out of TRACEE'S memory addr
 func readWord(pid int, addr uintptr) (uint64, bool) { // retval: 8byte word, true/false - success/fail
@@ -106,9 +177,9 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 	return out, count
 }
 
-// ======================================== end of STEP 3 FUNCTIONS ========================================
+// ======================================== end of STEP 3 FUNCTIONS ======================================== //
 
-// ======================================== start of STEP 4 FUNCTIONS ========================================
+// ======================================== start of STEP 4 FUNCTIONS ======================================== //
 
 // modifies the argv command and returns success/unsuccess + the new argv command
 func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
@@ -150,8 +221,9 @@ func runModifiedCmd(pid int, path string, newArgv, env []string) {
 	}
 }
 
-// ======================================== end of STEP 4 FUNCTIONS ========================================
+// ======================================== end of STEP 4 FUNCTIONS ======================================== //
 
+// MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN //
 func main() {
 	fmt.Printf("Number argc args: %d\n", len(os.Args))
 
@@ -160,16 +232,18 @@ func main() {
 		return
 	}
 
+	modify, command, ok := parseArgs(os.Args[1:])
+	if (!ok) {
+		return
+	}
+	fmt.Printf("modify=%v command=%q\n", modify, command)
+
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
 
 	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
 
-	// name := os.Args[1]
-	// args := os.Args[2:]
-
-	// cmd := exec.Command(name, args...)
-	// cmd.Stdin = os.Stdin
-	cmd := exec.Command(os.Args[1])
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -218,37 +292,38 @@ func main() {
 			// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
 			if syscall.PtraceGetRegs(pid, &regs) == nil {
 				if regs.Orig_rax == 59 && int64(regs.Rax) == -38 { // 59 filters for execve, -38 filters for only entry
-					path := readCString(pid, uintptr(regs.Rdi))
-					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
-					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
+					
+					var path string
+					var argv []string
+					var envv []string
+					var envc int
+					
+					path = readCString(pid, uintptr(regs.Rdi))
+					argv, _ = readAndCountStringArray(pid, uintptr(regs.Rsi))
+					envv, envc = readAndCountStringArray(pid, uintptr(regs.Rdx))
 					fmt.Printf("[%s pid %d] execve %q argv=%q /* %d env vars */ --- syscall num: %d\n",
 						procName(pid), pid, path, argv, envc, regs.Orig_rax)
 					fmt.Printf(" -- (●'◡'●) -- first few env: %q\n\n\n", envv[:min(5, len(envv))])
 					// rdi, rsi, rdx
 					
 
-					// TODO: find the output file (gcc cmd) - figure out compile cmds 
 					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
 					// then modify the cmd (see example comments below)
-					// ORIGINAL (first cmd) --- gcc -c file.c -o file.o
-					// MODIFIED (new cmd) ----- gcc -c file.c -o file.o.v2
 					fmt.Println("exec syscall entered")
 
+					// TODO: trace my new fork/new commmand made
 					if (strings.HasSuffix(path, "gcc")) {  // checks for cmd ending w/ gcc
 						present, newArgv := modifyArgvCmd(argv, "-o")
 						if (present) {
 							fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
 							runModifiedCmd(pid, path, newArgv, envv)
-						}
+
+							if modify {
+								regs.Orig_rax = ^uint64(0)  // -1 = invalid syscall --> kernel skips execve
+								syscall.PtraceSetRegs(pid, &regs)
+							}
+						}	
 					}
-
-					/* TODOODODO NEXT STEP
-					./main make
-
-					./main -- make
-					./main --modify -- make -j 8
-					./main --no-modify -- make
-					*/
 				}
 				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
 				// fmt.Printf("[%s pid %d] hit syscall id: %d\n", procName(childPid), childPid, regs.Orig_rax)
