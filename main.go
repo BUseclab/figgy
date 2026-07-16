@@ -18,8 +18,9 @@ import (
 //2. (DONE) trace syscall - need to trace all forks/clones
 //3. (DONE) parse/interpret args from syscall out of tracee memory
 //4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
-//	- SIDENOTE - right now focus on argv modification, can expand to envp modification ltr
-// 	- 3 Cases: Same/Lesser/Greater # of argv's
+//  - other improvments (useful features)
+//		- improve logging
+//		- not hardcoding changes/recompiling
 //5. (DONE) resume the process
 
 // Find actual arguments (execve args)
@@ -221,6 +222,21 @@ func runModifiedCmd(pid int, path string, newArgv, env []string) {
 	}
 }
 
+func writeCString(pid int, addr uintptr, s string) bool {
+	b := append([]byte(s), 0)
+	
+	for len(b)%8 != 0 {
+		b = append(b, 0)  // pad so final ptrace poke is a full word
+	}
+	for off := 0; off < len(b); off+=8 {
+		n, err := syscall.PtracePokeData(pid, addr+uintptr(off), b[off:off+8])
+		if (err != nil || n < 8) {
+			return false
+		}
+	}
+	return true
+}
+
 // ======================================== end of STEP 4 FUNCTIONS ======================================== //
 
 // MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN //
@@ -293,14 +309,9 @@ func main() {
 			if syscall.PtraceGetRegs(pid, &regs) == nil {
 				if regs.Orig_rax == 59 && int64(regs.Rax) == -38 { // 59 filters for execve, -38 filters for only entry
 					
-					var path string
-					var argv []string
-					var envv []string
-					var envc int
-					
-					path = readCString(pid, uintptr(regs.Rdi))
-					argv, _ = readAndCountStringArray(pid, uintptr(regs.Rsi))
-					envv, envc = readAndCountStringArray(pid, uintptr(regs.Rdx))
+					path := readCString(pid, uintptr(regs.Rdi))
+					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
+					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
 					fmt.Printf("[%s pid %d] execve %q argv=%q /* %d env vars */ --- syscall num: %d\n",
 						procName(pid), pid, path, argv, envc, regs.Orig_rax)
 					fmt.Printf(" -- (●'◡'●) -- first few env: %q\n\n\n", envv[:min(5, len(envv))])
@@ -309,20 +320,31 @@ func main() {
 
 					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
 					// then modify the cmd (see example comments below)
-					fmt.Println("exec syscall entered")
-
-					// TODO: trace my new fork/new commmand made
-					if (strings.HasSuffix(path, "gcc")) {  // checks for cmd ending w/ gcc
-						present, newArgv := modifyArgvCmd(argv, "-o")
-						if (present) {
-							fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
-							runModifiedCmd(pid, path, newArgv, envv)
-
-							if modify {
-								regs.Orig_rax = ^uint64(0)  // -1 = invalid syscall --> kernel skips execve
-								syscall.PtraceSetRegs(pid, &regs)
+					
+					// TODO: trace my new fork/new commmand made (DONE-------------------------------------------------------------------)
+					if (strings.HasSuffix(path, "cc")) {  // checks for cmd ending w/ "cc"
+						fmt.Println("exec syscall entered")
+						if modify {
+							for i := 0; i+1 < len(argv); i++ {
+								if (argv[i] == "-o") {
+									newOut := argv[i+1] + ".v2"
+									scratch := uintptr(regs.Rsp) - 1024
+									if (writeCString(pid, scratch, newOut)) {
+										slot := uintptr(regs.Rsi) + uintptr(i+1)*8  // calc mem addr of v2 filename
+										var p [8]byte  
+										binary.LittleEndian.PutUint64(p[:], uint64(scratch))
+										syscall.PtracePokeData(pid, slot, p[:])  // overwrites pointer inside og cmds argv array
+									}
+									break
+								}
 							}
-						}	
+						} else {
+							present, newArgv := modifyArgvCmd(argv, "-o")
+							if (present) {
+								fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
+								runModifiedCmd(pid, path, newArgv, envv)
+							}	
+						}
 					}
 				}
 				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
