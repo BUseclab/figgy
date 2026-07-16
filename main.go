@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"flag"
+	"log/slog"
 )
 
 //1. (DONE) fork build process
@@ -19,8 +20,10 @@ import (
 //3. (DONE) parse/interpret args from syscall out of tracee memory
 //4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
 //  - other improvments (useful features)
-//		- improve logging
-//		- not hardcoding changes/recompiling
+//		- (DONE) improve logging
+//		- (NOT STARTED) not hardcoding changes/recompiling
+//	- (IN PROGRESS) APPLICATIONS --> fuzzing w/ AFL++
+//		- pt fuzzer @ ls, coreutils, ***ffmpeg 
 //5. (DONE) resume the process
 
 // Find actual arguments (execve args)
@@ -41,78 +44,58 @@ import (
 	STEOS
 	- fetch registers to locate * arrays in tracee addr sapce
 	- read target strings using PTRACE_PEEKDATA or /proc/pid/mem access
-
 */
 
 // GOAL - trace all exec related syscalls
 
+// ======================================== Global Vars ======================================== //
+var logLevel = new(slog.LevelVar)
+
+// ======================================== QoL Functions ======================================== //
+func setupLogging() {
+	logLevel.Set(slog.LevelError)  // errors + info = default
+
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions {
+		Level: logLevel,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if (a.Key == slog.TimeKey && len(groups) == 0) {
+				return slog.Attr{}
+			}
+			
+			return a
+		},
+	})
+	slog.SetDefault(slog.New(h))
+}
+
 // ======================================== start of STEP 1 FUNCTIONS ========================================  //
 
 // parses the flags + commands (args) from the user command
-func parseArgs(args []string) (bool, []string, bool) {
+func parseArgs(args []string) (bool, []string, bool, bool) {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 
 	modify := fs.Bool("modify", false, "run only v2 cmd, don't run og")
-	// noModify := fs.Bool("no-modify", true, "run both og and v2 cmd")
+	debug := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: main [--modify] -- <cmd> [args...]")
+		// slog.Error(os.Stderr, "usage: main [--modify] [--debug] -- <cmd> [args...]")
+		fmt.Fprintf(os.Stderr, "usage: main [--modify] [--debug] -- <cmd> [args...]")
 		fs.PrintDefaults()
 	}
 
 	err := fs.Parse(args)
 	if (err != nil) {
-		return false, nil, false
+		return false, nil, false, false
 	}
 
 	command := fs.Args()
 	if (len(command) == 0) {
 		fs.Usage()
-		return false, nil, false
+		return false, nil, false, false
 	}
 
-	return *modify, command, true
+	return *modify, command, *debug, true
 }
-
-/*func parseArgs(args []string) (bool, []string, bool) {
-	modify := false
-	var command []string
-
-	sep := -1
-	for i, a := range args {
-		if (a == "--") {
-			sep = i
-			break
-		}
-	}
-
-	var flags []string
-	if (sep == -1) {
-		command = args
-	} else {	
-		flags = args[:sep]
-		command = args[sep+1:]
-	}
-
-	for _, f := range flags {
-		switch f {
-			case "--modify":
-				modify = true
-			case "--no-modify":
-				modify = false
-			default:
-				fmt.Printf("unknown flag: %s\n", f)
-				return false, nil, false
-		}		
-	}
-
-	if (len(command) == 0) {
-		fmt.Println("no command to trace (usage: ./main [--modify|--no-modify] -- <cmd> [args...])")
-		return false, nil, false
-	}
-
-	return modify, command, true
-}*/
 
 // ======================================== end of STEP 1 FUNCTIONS ======================================== //
 
@@ -218,7 +201,7 @@ func runModifiedCmd(pid int, path string, newArgv, env []string) {
 
 	err = c.Run()
 	if (err != nil) {
-		fmt.Printf("	duplicate run failed: %v\n", err)
+		slog.Error("duplicate run failed", "err", err)
 	}
 }
 
@@ -241,18 +224,25 @@ func writeCString(pid int, addr uintptr, s string) bool {
 
 // MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN //
 func main() {
-	fmt.Printf("Number argc args: %d\n", len(os.Args))
+	setupLogging()
+
+	slog.Debug("startup", "argc", len(os.Args))
+
+	// fmt.Printf("Number argc args: %d\n", len(os.Args))
 
 	if len(os.Args) < 2 {
-		fmt.Println("Need to pass in command to trace")
+		slog.Error("Need to pass in command to trace")
 		return
 	}
 
-	modify, command, ok := parseArgs(os.Args[1:])
+	modify, command, debug, ok := parseArgs(os.Args[1:])
 	if (!ok) {
 		return
 	}
-	fmt.Printf("modify=%v command=%q\n", modify, command)
+	if (debug) {
+		logLevel.Set(slog.LevelDebug)
+	}
+	slog.Debug("patsed args", "modify", modify, "command", command, "debug", debug)
 
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
 
@@ -269,7 +259,7 @@ func main() {
 	// fork + exec child
 	err := cmd.Start()
 	if err != nil {
-		fmt.Printf("fork failed: %v", err)
+		slog.Error("fork failed", "err", err)
 		return
 	}
 
@@ -293,12 +283,13 @@ func main() {
 		// wait for event from any child (-1)
 		pid, err := syscall.Wait4(-1, &status, 0, nil)
 		if err != nil { // traced all processes inc. fork/clone
-			fmt.Println("No traced processes left")
+			slog.Info("No traced processes left")
 			break
 		}
 
 		if status.Exited() || status.Signaled() { // cur pid died/ended/exited -> cont. to next
-			fmt.Printf("%s %d: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", procName(pid), pid)
+			// fmt.Printf("%s %d: Current tracked process exited... tracking next process\n", procName(pid), pid)
+			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
 		}
 
@@ -312,18 +303,26 @@ func main() {
 					path := readCString(pid, uintptr(regs.Rdi))
 					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
 					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
-					fmt.Printf("[%s pid %d] execve %q argv=%q /* %d env vars */ --- syscall num: %d\n",
-						procName(pid), pid, path, argv, envc, regs.Orig_rax)
-					fmt.Printf(" -- (●'◡'●) -- first few env: %q\n\n\n", envv[:min(5, len(envv))])
-					// rdi, rsi, rdx
 					
+					// fmt.Printf("[%s pid %d] execve %q argv=%q /* %d env vars */ --- syscall num: %d\n",
+					// 	procName(pid), pid, path, argv, envc, regs.Orig_rax)
+					// fmt.Printf(" -- (●'◡'●) -- first few env: %q\n\n\n", envv[:min(5, len(envv))])
+					// rdi, rsi, rdx
+
+					slog.Info("execve",
+						"proc", procName(pid),
+						"pid", pid,
+						"path", path,
+						"argv", argv,
+						"envc", envc,
+					)
+					slog.Debug("first few env vars", "env", envv[:min(5, len(envv))])
 
 					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
 					// then modify the cmd (see example comments below)
 					
-					// TODO: trace my new fork/new commmand made (DONE-------------------------------------------------------------------)
 					if (strings.HasSuffix(path, "cc")) {  // checks for cmd ending w/ "cc"
-						fmt.Println("exec syscall entered")
+						slog.Debug("cc exec detected", "path", path)
 						if modify {
 							for i := 0; i+1 < len(argv); i++ {
 								if (argv[i] == "-o") {
@@ -334,6 +333,8 @@ func main() {
 										var p [8]byte  
 										binary.LittleEndian.PutUint64(p[:], uint64(scratch))
 										syscall.PtracePokeData(pid, slot, p[:])  // overwrites pointer inside og cmds argv array
+									
+										slog.Debug("rewrote -o target", "pid", pid, "newOut", newOut)
 									}
 									break
 								}
@@ -341,7 +342,8 @@ func main() {
 						} else {
 							present, newArgv := modifyArgvCmd(argv, "-o")
 							if (present) {
-								fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
+								slog.Info("duplicating command", "newArgv", newArgv)
+								// fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
 								runModifiedCmd(pid, path, newArgv, envv)
 							}	
 						}
