@@ -1,6 +1,9 @@
 // (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) //
 // - (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ - //
 
+// EXAMPLE USAGE
+// EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1 
+
 package main
 
 import (
@@ -18,40 +21,13 @@ import (
 	"interposer/module"
 )
 
-//1. (DONE) fork build process
-//2. (DONE) trace syscall - need to trace all forks/clones
-//3. (DONE) parse/interpret args from syscall out of tracee memory
-//4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
-//  - other improvments (useful features)
-//		- (DONE) improve logging
-//		- (IN PROGRESS) not hardcoding changes/recompiling
-//	- (IN PROGRESS) APPLICATIONS --> fuzzing w/ AFL++
-//		- pt fuzzer @ ls, coreutils, ***ffmpeg 
-//5. (DONE) resume the process
+const (
+	ModeModify = "modify"
+	ModeNoModify = "nomodify"
+	ModeNoModifyDrop = "nomodify-drop"
+)
 
-// Find actual arguments (execve args)
-// execve signature: int execve(const char *pathname, char *const argv[], char *const envp[]);
-/*
-	- Sys Call ID/Ret Val - %rax
-	- Arg1 - %rdi
-	- Arg2 - %rsi
-	- Arg3 - %rdx
-	- Arg4 - %r10
-	- Arg5 - %r8
-	- Arg6 - %r9
-
-	rdi --> *pathname
-	rsi --> *argv (arg vector array)
-	rdx --> *envp (env var array)
-
-	STEOS
-	- fetch registers to locate * arrays in tracee addr sapce
-	- read target strings using PTRACE_PEEKDATA or /proc/pid/mem access
-
-	EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1 
-*/
-
-// GOAL - trace all exec related syscalls
+const droppedExecPath = "/nonexistent-dropped-by-interposer"
 
 // ======================================== Global Vars ======================================== //
 var logLevel = new(slog.LevelVar)
@@ -76,30 +52,36 @@ func setupLogging() {
 // ======================================== start of STEP 1 FUNCTIONS ========================================  //
 
 // parses the flags + commands (args) from the user command
-func parseArgs(args []string) (bool, []string, bool, string, bool) {
+func parseArgs(args []string) (string, []string, bool, string, bool) {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 
-	modify := fs.Bool("modify", false, "run only v2 cmd, don't run og")
-	debug := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
-	modulePath := fs.String("module", "", "path to a compiled .so module implementing module.Interceptor")
+	modeFlag := fs.String("mode", ModeNoModify, "exec modes: modify | nomodify | nomodify-drop")
+	debugFlag := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
+	moduleFlag := fs.String("module", "", "path to a compiled .so module implementing module.Interceptor")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: main [--modify] [--debug] [--module path.so] -- <cmd> [args...]\n")
+		fmt.Fprintf(os.Stderr, "usage: main [--mode modify{nomodify|nomodify-drop}] [--debug] [--module path.so] -- <cmd> [args...]\n")
 		fs.PrintDefaults()
 	}
 
 	err := fs.Parse(args)
 	if (err != nil) {
-		return false, nil, false, "", false
+		return "", nil, false, "", false
+	}
+
+	if (*modeFlag != ModeModify && *modeFlag != ModeNoModify && *modeFlag != ModeNoModifyDrop) {
+		fmt.Fprintf(os.Stderr, "invalid --mode %q\n", *modeFlag)
+		fs.Usage()
+		return "", nil, false, "", false
 	}
 
 	command := fs.Args()
 	if (len(command) == 0) {
 		fs.Usage()
-		return false, nil, false, "", false
+		return "", nil, false, "", false
 	}
 
-	return *modify, command, *debug, *modulePath, true
+	return *modeFlag, command, *debugFlag, *moduleFlag, true
 }
 
 // ======================================== end of STEP 1 FUNCTIONS ======================================== //
@@ -190,10 +172,10 @@ func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
 	return false, nil
 }
 
-func runModifiedCmd(pid int, path string, newArgv, env []string) {
-	c := exec.Command(path)
-	c.Args = newArgv
-	c.Env = env
+func runModifiedCmd(pid int, call module.ExecCall) {
+	c := exec.Command(call.Path)
+	c.Args = call.Argv
+	c.Env = call.Envp
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout 
 	c.Stderr = os.Stderr 
@@ -249,6 +231,7 @@ func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 	return true
 }
 
+// MODIFY MODE ONLY - modifies tracee's own og execve syscall args/path
 func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
 	if (orig.Path != updated.Path) {
 		if (!redirectExecve(pid, regs, updated.Path)) {
@@ -261,7 +244,7 @@ func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.
 		return false
 	}
 
-	scratchBase := uintptr(regs.Rsp) - 16384  // sep scratch region from path/-o changes
+	scratchBase := uintptr(regs.Rsp) - 16384  // sep scratch region from path changes
 	offset := uintptr(0)
 
 	for i := range updated.Argv {
@@ -325,14 +308,14 @@ func main() {
 		return
 	}
 
-	modify, command, debug, modulePath, ok := parseArgs(os.Args[1:])
+	mode, command, debug, modulePath, ok := parseArgs(os.Args[1:])
 	if (!ok) {
 		return
 	}
 	if (debug) {
 		logLevel.Set(slog.LevelDebug)
 	}
-	slog.Debug("patsed args", "modify", modify, "command", command, "debug", debug, "module", modulePath)
+	slog.Debug("patsed args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
 
 	var interceptor module.Interceptor
 	if (modulePath != "") {
@@ -384,12 +367,12 @@ func main() {
 	for {
 		// wait for event from any child (-1)
 		pid, err := syscall.Wait4(-1, &status, 0, nil)
-		if err != nil { // traced all processes inc. fork/clone
+		if (err != nil) { // traced all processes inc. fork/clone
 			slog.Info("No traced processes left")
 			break
 		}
 
-		if status.Exited() || status.Signaled() { // cur pid died/ended/exited -> cont. to next
+		if (status.Exited() || status.Signaled()) { // cur pid died/ended/exited -> cont. to next
 			// fmt.Printf("%s %d: Current tracked process exited... tracking next process\n", procName(pid), pid)
 			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
@@ -397,9 +380,9 @@ func main() {
 
 		sig := status.StopSignal()
 
-		if sig == syscall.SIGTRAP|0x80 { // syscall enter/exit boundary
+		if (sig == syscall.SIGTRAP|0x80) { // syscall enter/exit boundary
 			// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
-			if syscall.PtraceGetRegs(pid, &regs) == nil {
+			if (syscall.PtraceGetRegs(pid, &regs)) == nil {
 				if regs.Orig_rax == 59 && int64(regs.Rax) == -38 { // 59 filters for execve, -38 filters for only entry
 					
 					path := readCString(pid, uintptr(regs.Rdi))
@@ -422,50 +405,57 @@ func main() {
 
 					// ############################## STEP 4. Modify execve args 4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4 FOUR FOUR FOUR FOUR FOUR FOUR
 
+					orig := module.ExecCall{Path: path, Argv: argv, Envp: envv}
+					updated := orig
+					changed := false
+
 					// switch modules
 					if (interceptor != nil) {
-						call := module.ExecCall{Path: path, Argv: argv, Envp: envv}
-						newCall, changed := interceptor.Transform(call)
+						newCall, changed := interceptor.Transform(orig)
 
 						if (changed) {
-							if (applyExecCallPatch(pid, &regs, call, newCall)) {
-								slog.Info("module patched exec", "module", interceptor.Name(), "pid", pid)
-							}
+							updated = newCall
+							changed = true
 						}
 					}
 
 					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
 					// then modify the cmd (see example comments below)
 					
-					if (strings.HasSuffix(path, "cc")) {  // checks for cmd ending w/ "cc"
+					if (strings.HasSuffix(path, "cc")) {
 						slog.Debug("cc exec detected", "path", path)
-						if modify {
-							for i := 0; i+1 < len(argv); i++ {
-								if (argv[i] == "-o") {
-									newOut := argv[i+1] + ".v2"
-									scratch := uintptr(regs.Rsp) - 1024
-									if (writeCString(pid, scratch, newOut)) {
-										slot := uintptr(regs.Rsi) + uintptr(i+1)*8  // calc mem addr of v2 filename
-										var p [8]byte  
-										binary.LittleEndian.PutUint64(p[:], uint64(scratch))
-										syscall.PtracePokeData(pid, slot, p[:])  // overwrites pointer inside og cmds argv array
-									
-										slog.Debug("rewrote -o target", "pid", pid, "newOut", newOut)
-									}
-									break
-								}
-							}
-						} else {
-							present, newArgv := modifyArgvCmd(argv, "-o")
-							if (present) {
-								slog.Info("duplicating command", "newArgv", newArgv)
-								runModifiedCmd(pid, path, newArgv, envv)
-							}	
+						present, newArgv := modifyArgvCmd(updated.Argv, "-o")
+						
+						if (present) {
+							updated.Argv = newArgv
+							changed = true
 						}
+					}
+
+					if (changed) {
+						switch mode {
+							case ModeModify:
+								if (applyExecCallPatch(pid, &regs, orig, updated)) {
+									slog.Info("modify: modified tracee's original execve", "pid", pid)
+								}
+							
+							case ModeNoModify:
+								slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
+								runModifiedCmd(pid, updated)
+
+							case ModeNoModifyDrop:
+								slog.Info("nomodify-drop: running modified cmd, drops og execve", "pid", pid)
+								runModifiedCmd(pid, updated)
+
+								if (redirectExecve(pid, &regs, droppedExecPath)) {
+									slog.Debug("dropped og execve", "pid", pid)
+								}
+						}
+
 					}
 				}
 				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
-				// fmt.Printf("[%s pid %d] hit syscall id: %d\n", procName(childPid), childPid, regs.Orig_rax)
+				// fmt.Printf("[%s pid %d] hit syscall id: %d\n", procName(childPid), childPid, regs.Orig_rax)  
 			}
 			syscall.PtraceSyscall(pid, 0)
 		} else if status.TrapCause() != -1 { // fork event stops on parent (child created) -> resume it
