@@ -13,6 +13,9 @@ import (
 	"syscall"
 	"flag"
 	"log/slog"
+	"plugin"
+
+	"interposer/module"
 )
 
 //1. (DONE) fork build process
@@ -21,7 +24,7 @@ import (
 //4. (IN PROGRESS) modify command (replace args in tracee memory by modifying registers)
 //  - other improvments (useful features)
 //		- (DONE) improve logging
-//		- (NOT STARTED) not hardcoding changes/recompiling
+//		- (IN PROGRESS) not hardcoding changes/recompiling
 //	- (IN PROGRESS) APPLICATIONS --> fuzzing w/ AFL++
 //		- pt fuzzer @ ls, coreutils, ***ffmpeg 
 //5. (DONE) resume the process
@@ -44,6 +47,8 @@ import (
 	STEOS
 	- fetch registers to locate * arrays in tracee addr sapce
 	- read target strings using PTRACE_PEEKDATA or /proc/pid/mem access
+
+	EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1 
 */
 
 // GOAL - trace all exec related syscalls
@@ -71,30 +76,30 @@ func setupLogging() {
 // ======================================== start of STEP 1 FUNCTIONS ========================================  //
 
 // parses the flags + commands (args) from the user command
-func parseArgs(args []string) (bool, []string, bool, bool) {
+func parseArgs(args []string) (bool, []string, bool, string, bool) {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 
 	modify := fs.Bool("modify", false, "run only v2 cmd, don't run og")
 	debug := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
+	modulePath := fs.String("module", "", "path to a compiled .so module implementing module.Interceptor")
 
 	fs.Usage = func() {
-		// slog.Error(os.Stderr, "usage: main [--modify] [--debug] -- <cmd> [args...]")
-		fmt.Fprintf(os.Stderr, "usage: main [--modify] [--debug] -- <cmd> [args...]")
+		fmt.Fprintf(os.Stderr, "usage: main [--modify] [--debug] [--module path.so] -- <cmd> [args...]\n")
 		fs.PrintDefaults()
 	}
 
 	err := fs.Parse(args)
 	if (err != nil) {
-		return false, nil, false, false
+		return false, nil, false, "", false
 	}
 
 	command := fs.Args()
 	if (len(command) == 0) {
 		fs.Usage()
-		return false, nil, false, false
+		return false, nil, false, "", false
 	}
 
-	return *modify, command, *debug, true
+	return *modify, command, *debug, *modulePath, true
 }
 
 // ======================================== end of STEP 1 FUNCTIONS ======================================== //
@@ -220,6 +225,91 @@ func writeCString(pid int, addr uintptr, s string) bool {
 	return true
 }
 
+// overwrites pathname (Rdi) arg of execve so tracee execs a diff binary
+// argv/envp (Rsi/Rdx) not edited --> replacement sees same invocation context
+func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
+	if (len(newPath) > 4096) {
+		slog.Error("replacement path too long", "pid", pid, "len", len(newPath))
+		return false
+	}
+
+	scratch := uintptr(regs.Rsp) - 8192
+
+	if (!writeCString(pid, scratch, newPath)) {
+		slog.Error("failed to write replacement path to tracee memory", "pid", pid)
+		return false
+	}
+
+	regs.Rdi = uint64(scratch)
+	err := syscall.PtraceSetRegs(pid, regs)
+	if (err != nil) {
+		slog.Error("failed to set regs for exec redirection", "pid", pid, "err", err)
+		return false
+	}
+	return true
+}
+
+func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
+	if (orig.Path != updated.Path) {
+		if (!redirectExecve(pid, regs, updated.Path)) {
+			return false
+		}
+	}
+
+	if (len(orig.Argv) != len(updated.Argv)) {
+		slog.Error("module changed argv length. Only equal length argv supported", "pid", pid)
+		return false
+	}
+
+	scratchBase := uintptr(regs.Rsp) - 16384  // sep scratch region from path/-o changes
+	offset := uintptr(0)
+
+	for i := range updated.Argv {
+		if (orig.Argv[i] == updated.Argv[i]) {
+			continue
+		}
+
+		addr := scratchBase + offset
+		if (!writeCString(pid, addr, updated.Argv[i])) {
+			slog.Error("failed to write patched argv string", "pid", pid, "index", i)
+			return false
+		}
+
+		slot := uintptr(regs.Rsi) + uintptr(i)*8
+		var p [8]byte
+		binary.LittleEndian.PutUint64(p[:], uint64(addr))
+		
+		_, err := syscall.PtracePokeData(pid, slot, p[:])
+		if (err != nil) {
+			slog.Error("failed to patch argv pointer", "pid", pid, "index", i, "err", err)
+			return false
+		}
+
+		offset += 512  // headroom to avoid overlapping writes
+	}
+	return true
+}
+
+// opens a compiled .so and looks up its New() constructor
+func loadModule(path string) (module.Interceptor, error) {
+	p, err := plugin.Open(path)
+	if (err != nil) {
+		return nil, fmt.Errorf("opening module: %w", err)
+	}
+
+	sym, err := p.Lookup("New")
+	if (err != nil) {
+		return nil, fmt.Errorf("module missing New() constructor: %w", err)
+	}
+
+	newFn, ok := sym.(func() module.Interceptor)
+	if (!ok) {
+		return nil, fmt.Errorf("module New() has wrong signature, expected func() module.Interceptor")
+	}
+
+	return newFn(), nil
+}
+
 // ======================================== end of STEP 4 FUNCTIONS ======================================== //
 
 // MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN //
@@ -235,14 +325,26 @@ func main() {
 		return
 	}
 
-	modify, command, debug, ok := parseArgs(os.Args[1:])
+	modify, command, debug, modulePath, ok := parseArgs(os.Args[1:])
 	if (!ok) {
 		return
 	}
 	if (debug) {
 		logLevel.Set(slog.LevelDebug)
 	}
-	slog.Debug("patsed args", "modify", modify, "command", command, "debug", debug)
+	slog.Debug("patsed args", "modify", modify, "command", command, "debug", debug, "module", modulePath)
+
+	var interceptor module.Interceptor
+	if (modulePath != "") {
+		var err error
+		interceptor, err = loadModule(modulePath)
+
+		if (err != nil) {
+			slog.Error("failed to load module", "path", modulePath, "err", err)
+			return
+		}
+		slog.Info("loaded module", "name", interceptor.Name())
+	}
 
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
 
@@ -318,6 +420,20 @@ func main() {
 					)
 					slog.Debug("first few env vars", "env", envv[:min(5, len(envv))])
 
+					// ############################## STEP 4. Modify execve args 4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4 FOUR FOUR FOUR FOUR FOUR FOUR
+
+					// switch modules
+					if (interceptor != nil) {
+						call := module.ExecCall{Path: path, Argv: argv, Envp: envv}
+						newCall, changed := interceptor.Transform(call)
+
+						if (changed) {
+							if (applyExecCallPatch(pid, &regs, call, newCall)) {
+								slog.Info("module patched exec", "module", interceptor.Name(), "pid", pid)
+							}
+						}
+					}
+
 					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
 					// then modify the cmd (see example comments below)
 					
@@ -343,7 +459,6 @@ func main() {
 							present, newArgv := modifyArgvCmd(argv, "-o")
 							if (present) {
 								slog.Info("duplicating command", "newArgv", newArgv)
-								// fmt.Printf("	--> duplicating as %q\n\n\n", newArgv)
 								runModifiedCmd(pid, path, newArgv, envv)
 							}	
 						}
