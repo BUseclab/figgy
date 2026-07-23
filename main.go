@@ -18,11 +18,6 @@
 	rdi --> *pathname
 	rsi --> *argv (arg vector array)
 	rdx --> *envp (env var array)
-
-	STEOS
-	- fetch registers to locate * arrays in tracee addr sapce
-	- read target strings using PTRACE_PEEKDATA or /proc/pid/mem access
-
 */
 
 package main
@@ -407,8 +402,6 @@ func main() {
 
 	slog.Debug("startup", "argc", len(os.Args))
 
-	// fmt.Printf("Number argc args: %d\n", len(os.Args))
-
 	if len(os.Args) < 2 {
 		slog.Error("Need to pass in command to trace")
 		return
@@ -421,7 +414,7 @@ func main() {
 	if (debug) {
 		logLevel.Set(slog.LevelDebug)
 	}
-	slog.Debug("patsed args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
+	slog.Debug("pasted args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
 
 	var interceptor module.Interceptor
 	if (modulePath != "") {
@@ -479,7 +472,6 @@ func main() {
 		}
 
 		if (status.Exited() || status.Signaled()) { // cur pid died/ended/exited -> cont. to next
-			// fmt.Printf("%s %d: Current tracked process exited... tracking next process\n", procName(pid), pid)
 			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
 		}
@@ -520,9 +512,7 @@ func main() {
 						}
 					}
 
-					// everytime thers a gcc cmd, duplicate the cmd (like rerun it below instead of os.args[2])
-					// then modify the cmd (see example comments below)
-					
+					// everytime thers a gcc cmd, duplicate the cmd then modify it
 					if (strings.HasSuffix(path, "cc")) {
 						slog.Debug("cc exec detected", "path", path)
 						present, newArgv := modifyArgvCmd(updated.Argv, "-o")
@@ -539,13 +529,7 @@ func main() {
 								if (applyExecCallPatch(pid, &regs, orig, updated)) {
 									slog.Info("modify: modified tracee's original execve", "pid", pid)
 								}
-								
-								// ============================== DEBUG INFORMATION ==============================
-								// var verify syscall.PtraceRegs  
-								// if syscall.PtraceGetRegs(pid, &verify) == nil {
-								// 	readBack, _ := readAndCountStringArray(pid, uintptr(verify.Rsi))
-								// 	slog.Debug("post-patch argv readback", "argv", readBack)
-								// }
+
 							case ModeNoModify:
 								slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
 								runModifiedCmd(pid, updated)
@@ -560,8 +544,6 @@ func main() {
 						}
 					}
 				}
-				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
-				// fmt.Printf("[%s pid %d] hit syscall id: %d\n", procName(childPid), childPid, regs.Orig_rax)  
 			}
 			syscall.PtraceSyscall(pid, 0)
 		} else if status.TrapCause() != -1 { // fork event stops on parent (child created) -> resume it
