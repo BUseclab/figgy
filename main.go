@@ -2,21 +2,42 @@
 // - (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ - //
 
 // EXAMPLE USAGE
-// EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1 
+// EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1
+
+// Find actual arguments (execve args)
+// execve signature: int execve(const char *pathname, char *const argv[], char *const envp[]);
+/*
+	- Sys Call ID/Ret Val - %rax
+	- Arg1 - %rdi
+	- Arg2 - %rsi
+	- Arg3 - %rdx
+	- Arg4 - %r10
+	- Arg5 - %r8
+	- Arg6 - %r9
+
+	rdi --> *pathname
+	rsi --> *argv (arg vector array)
+	rdx --> *envp (env var array)
+
+	STEOS
+	- fetch registers to locate * arrays in tracee addr sapce
+	- read target strings using PTRACE_PEEKDATA or /proc/pid/mem access
+
+*/
 
 package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"plugin"
 	"runtime"
 	"strings"
 	"syscall"
-	"flag"
-	"log/slog"
-	"plugin"
 
 	"interposer/module"
 )
@@ -173,6 +194,8 @@ func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
 }
 
 func runModifiedCmd(pid int, call module.ExecCall) {
+	slog.Info("spawning duplicate process", "path", call.Path, "argv", call.Argv, "envc", len(call.Envp))
+
 	c := exec.Command(call.Path)
 	c.Args = call.Argv
 	c.Env = call.Envp
@@ -189,6 +212,8 @@ func runModifiedCmd(pid int, call module.ExecCall) {
 	err = c.Run()
 	if (err != nil) {
 		slog.Error("duplicate run failed", "err", err)
+	} else {
+		slog.Debug("duplicate run completed successfully", "path", call.Path)
 	}
 }
 
@@ -201,6 +226,59 @@ func writeCString(pid int, addr uintptr, s string) bool {
 	for off := 0; off < len(b); off+=8 {
 		n, err := syscall.PtracePokeData(pid, addr+uintptr(off), b[off:off+8])
 		if (err != nil || n < 8) {
+			return false
+		}
+	}
+	return true
+}
+
+// writes NULL terminated array of string pointers into tracee memory + ret. addr of ptr table
+func writeStringArray(pid int, base uintptr, strs []string) (uintptr, bool) {
+	addrs := make([]uintptr, len(strs))
+	offset := uintptr(0)
+
+	// writes raw text (argv values) into process memory
+	for i, s := range strs {
+		addr := base + offset
+		if (!writeCString(pid, addr, s)) {
+			slog.Error("failed to write argv string", "pid", pid, "index", i)
+			return 0, false
+		}
+		addrs[i] = addr
+
+		padded := len(s) + 1  // +1 is for NUL terminator
+		if (padded % 8 != 0) {
+			padded += 8 - (padded % 8)
+		}
+		offset += uintptr(padded)
+	}
+
+	// creates byte buffer to the strings in for loop above
+	ptrTableAddr := base + offset
+	buf := make([]byte, (len(addrs)+1)*8)
+	for i, a := range addrs {
+		binary.LittleEndian.PutUint64(buf[i*8:], uint64(a))
+	}
+
+	// writes local ptr table to remote target process memory space
+	for off := 0; off < len(buf); off += 8 {
+		n, err := syscall.PtracePokeData(pid, ptrTableAddr+uintptr(off), buf[off:off+8])
+		if (err != nil || n < 8) {
+			slog.Error("failed to write argv pointer table", "pid", pid)
+			return 0, false
+		}
+	}
+
+	return ptrTableAddr, true
+}
+
+// checks if 2 argv string arrays are equal
+func argvEqual(a, b []string) bool {
+	if (len(a) != len(b)) {
+		return false
+	}
+	for i := range a {
+		if (a[i] != b[i]) {
 			return false
 		}
 	}
@@ -234,30 +312,40 @@ func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 // MODIFY MODE ONLY - modifies tracee's own og execve syscall args/path
 func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
 	if (orig.Path != updated.Path) {
+		// overwrites path
 		if (!redirectExecve(pid, regs, updated.Path)) {
 			return false
 		}
 	}
 
-	if (len(orig.Argv) != len(updated.Argv)) {
-		slog.Error("module changed argv length. Only equal length argv supported", "pid", pid)
-		return false
+	if (argvEqual(orig.Argv, updated.Argv)) {
+		return true
 	}
 
+	// modifies argv (same/more/less argv)
+	if (len(orig.Argv) == len(updated.Argv)) {
+		return patchArgvVectorInPlace(pid, regs, orig, updated)
+	}
+
+	return rebuildArgvTable(pid, regs, updated)	
+}
+
+// directly edits argv in og execve cmd (only works w/ same # of argv args)
+func patchArgvVectorInPlace(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
 	scratchBase := uintptr(regs.Rsp) - 16384  // sep scratch region from path changes
 	offset := uintptr(0)
-
+	
 	for i := range updated.Argv {
 		if (orig.Argv[i] == updated.Argv[i]) {
 			continue
 		}
-
+		
 		addr := scratchBase + offset
 		if (!writeCString(pid, addr, updated.Argv[i])) {
 			slog.Error("failed to write patched argv string", "pid", pid, "index", i)
 			return false
 		}
-
+		
 		slot := uintptr(regs.Rsi) + uintptr(i)*8
 		var p [8]byte
 		binary.LittleEndian.PutUint64(p[:], uint64(addr))
@@ -267,8 +355,26 @@ func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.
 			slog.Error("failed to patch argv pointer", "pid", pid, "index", i, "err", err)
 			return false
 		}
-
+		
 		offset += 512  // headroom to avoid overlapping writes
+	}
+	return true
+}
+
+// dir edits og execve argv --> inc/dec size of argv (only works for diff # of argv args)
+func rebuildArgvTable(pid int, regs *syscall.PtraceRegs, updated module.ExecCall) bool {
+	argvScratch := uintptr(regs.Rsp) - 16384
+
+	ptrTableAddr, ok := writeStringArray(pid, argvScratch, updated.Argv)
+	if (!ok) {
+		return false
+	}
+	
+	regs.Rsi = uint64(ptrTableAddr)
+	err := syscall.PtraceSetRegs(pid, regs)
+	if (err != nil) {
+		slog.Error("failed to set regs for argv redirection", "pid", pid, "err", err)
+		return false
 	}
 	return true
 }
@@ -389,11 +495,6 @@ func main() {
 					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
 					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
 					
-					// fmt.Printf("[%s pid %d] execve %q argv=%q /* %d env vars */ --- syscall num: %d\n",
-					// 	procName(pid), pid, path, argv, envc, regs.Orig_rax)
-					// fmt.Printf(" -- (●'◡'●) -- first few env: %q\n\n\n", envv[:min(5, len(envv))])
-					// rdi, rsi, rdx
-
 					slog.Info("execve",
 						"proc", procName(pid),
 						"pid", pid,
@@ -411,9 +512,9 @@ func main() {
 
 					// switch modules
 					if (interceptor != nil) {
-						newCall, changed := interceptor.Transform(orig)
+						newCall, ch := interceptor.Transform(orig)
 
-						if (changed) {
+						if (ch) {
 							updated = newCall
 							changed = true
 						}
@@ -438,7 +539,13 @@ func main() {
 								if (applyExecCallPatch(pid, &regs, orig, updated)) {
 									slog.Info("modify: modified tracee's original execve", "pid", pid)
 								}
-							
+								
+								// ============================== DEBUG INFORMATION ==============================
+								// var verify syscall.PtraceRegs  
+								// if syscall.PtraceGetRegs(pid, &verify) == nil {
+								// 	readBack, _ := readAndCountStringArray(pid, uintptr(verify.Rsi))
+								// 	slog.Debug("post-patch argv readback", "argv", readBack)
+								// }
 							case ModeNoModify:
 								slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
 								runModifiedCmd(pid, updated)
@@ -451,7 +558,6 @@ func main() {
 									slog.Debug("dropped og execve", "pid", pid)
 								}
 						}
-
 					}
 				}
 				// Optional - uncomment to see all syscalls called, comment to only see execve syscalls
