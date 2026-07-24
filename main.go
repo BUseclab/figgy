@@ -29,36 +29,40 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"plugin"
 	"runtime"
 	"strings"
 	"syscall"
 
+	// "golang.org/x/net/bpf"
+	// "golang.org/x/sys/unix"
+
 	"interposer/module"
 )
 
+// ======================================== Global Vars & Constants ======================================== //
 const (
-	ModeModify = "modify"
-	ModeNoModify = "nomodify"
+	ModeModify       = "modify"
+	ModeNoModify     = "nomodify"
 	ModeNoModifyDrop = "nomodify-drop"
 )
 
 const droppedExecPath = "/nonexistent-dropped-by-interposer"
 
-// ======================================== Global Vars ======================================== //
 var logLevel = new(slog.LevelVar)
 
 // ======================================== QoL Functions ======================================== //
 func setupLogging() {
-	logLevel.Set(slog.LevelError)  // errors + info = default
+	logLevel.Set(slog.LevelError) // errors + info = default
 
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions {
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if (a.Key == slog.TimeKey && len(groups) == 0) {
+			if a.Key == slog.TimeKey && len(groups) == 0 {
 				return slog.Attr{}
 			}
-			
+
 			return a
 		},
 	})
@@ -81,18 +85,18 @@ func parseArgs(args []string) (string, []string, bool, string, bool) {
 	}
 
 	err := fs.Parse(args)
-	if (err != nil) {
+	if err != nil {
 		return "", nil, false, "", false
 	}
 
-	if (*modeFlag != ModeModify && *modeFlag != ModeNoModify && *modeFlag != ModeNoModifyDrop) {
+	if *modeFlag != ModeModify && *modeFlag != ModeNoModify && *modeFlag != ModeNoModifyDrop {
 		fmt.Fprintf(os.Stderr, "invalid --mode %q\n", *modeFlag)
 		fs.Usage()
 		return "", nil, false, "", false
 	}
 
 	command := fs.Args()
-	if (len(command) == 0) {
+	if len(command) == 0 {
 		fs.Usage()
 		return "", nil, false, "", false
 	}
@@ -164,6 +168,32 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 	return out, count
 }
 
+func resolveTraceePath(pid int, path string) string {
+	if (filepath.IsAbs(path)) {
+		return path
+	}
+
+	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
+	if (err != nil) {
+		return path
+	}
+
+	return filepath.Join(cwd, path)
+}
+
+func IsSetUidBinary(pid int, path string) (bool, error) {
+	info, err := os.Stat(resolveTraceePath(pid, path))  // needs superuser perms to check file info
+	if (err != nil) {
+		if (os.IsNotExist(err)) {
+			return false, nil	
+		}
+		return false, err
+	}
+
+	hasSetuid := info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0
+	return hasSetuid, nil
+}
+
 // ======================================== end of STEP 3 FUNCTIONS ======================================== //
 
 // ======================================== start of STEP 4 FUNCTIONS ======================================== //
@@ -172,12 +202,12 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
 	newArgv := make([]string, len(ogArgv))
 	copy(newArgv, ogArgv)
-	
+
 	// modifies the value after the flag passed in
 	for i := 0; i < len(newArgv); i++ {
 		a := newArgv[i]
-		if (a == flagName) {
-			if (i+1 >= len(newArgv)) {
+		if a == flagName {
+			if i+1 >= len(newArgv) {
 				return false, nil
 			}
 			newArgv[i+1] = newArgv[i+1] + ".v2"
@@ -195,17 +225,17 @@ func runModifiedCmd(pid int, call module.ExecCall) {
 	c.Args = call.Argv
 	c.Env = call.Envp
 	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout 
-	c.Stderr = os.Stderr 
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
 
-	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))  // go to targets cwd
-	
-	if (err == nil) {
+	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)) // go to targets cwd
+
+	if err == nil {
 		c.Dir = cwd
 	}
 
 	err = c.Run()
-	if (err != nil) {
+	if err != nil {
 		slog.Error("duplicate run failed", "err", err)
 	} else {
 		slog.Debug("duplicate run completed successfully", "path", call.Path)
@@ -214,13 +244,13 @@ func runModifiedCmd(pid int, call module.ExecCall) {
 
 func writeCString(pid int, addr uintptr, s string) bool {
 	b := append([]byte(s), 0)
-	
+
 	for len(b)%8 != 0 {
-		b = append(b, 0)  // pad so final ptrace poke is a full word
+		b = append(b, 0) // pad so final ptrace poke is a full word
 	}
-	for off := 0; off < len(b); off+=8 {
+	for off := 0; off < len(b); off += 8 {
 		n, err := syscall.PtracePokeData(pid, addr+uintptr(off), b[off:off+8])
-		if (err != nil || n < 8) {
+		if err != nil || n < 8 {
 			return false
 		}
 	}
@@ -235,14 +265,14 @@ func writeStringArray(pid int, base uintptr, strs []string) (uintptr, bool) {
 	// writes raw text (argv values) into process memory
 	for i, s := range strs {
 		addr := base + offset
-		if (!writeCString(pid, addr, s)) {
+		if !writeCString(pid, addr, s) {
 			slog.Error("failed to write argv string", "pid", pid, "index", i)
 			return 0, false
 		}
 		addrs[i] = addr
 
-		padded := len(s) + 1  // +1 is for NUL terminator
-		if (padded % 8 != 0) {
+		padded := len(s) + 1 // +1 is for NUL terminator
+		if padded%8 != 0 {
 			padded += 8 - (padded % 8)
 		}
 		offset += uintptr(padded)
@@ -258,7 +288,7 @@ func writeStringArray(pid int, base uintptr, strs []string) (uintptr, bool) {
 	// writes local ptr table to remote target process memory space
 	for off := 0; off < len(buf); off += 8 {
 		n, err := syscall.PtracePokeData(pid, ptrTableAddr+uintptr(off), buf[off:off+8])
-		if (err != nil || n < 8) {
+		if err != nil || n < 8 {
 			slog.Error("failed to write argv pointer table", "pid", pid)
 			return 0, false
 		}
@@ -269,11 +299,11 @@ func writeStringArray(pid int, base uintptr, strs []string) (uintptr, bool) {
 
 // checks if 2 argv string arrays are equal
 func argvEqual(a, b []string) bool {
-	if (len(a) != len(b)) {
+	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if (a[i] != b[i]) {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -283,21 +313,21 @@ func argvEqual(a, b []string) bool {
 // overwrites pathname (Rdi) arg of execve so tracee execs a diff binary
 // argv/envp (Rsi/Rdx) not edited --> replacement sees same invocation context
 func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
-	if (len(newPath) > 4096) {
+	if len(newPath) > 4096 {
 		slog.Error("replacement path too long", "pid", pid, "len", len(newPath))
 		return false
 	}
 
 	scratch := uintptr(regs.Rsp) - 8192
 
-	if (!writeCString(pid, scratch, newPath)) {
+	if !writeCString(pid, scratch, newPath) {
 		slog.Error("failed to write replacement path to tracee memory", "pid", pid)
 		return false
 	}
 
 	regs.Rdi = uint64(scratch)
 	err := syscall.PtraceSetRegs(pid, regs)
-	if (err != nil) {
+	if err != nil {
 		slog.Error("failed to set regs for exec redirection", "pid", pid, "err", err)
 		return false
 	}
@@ -306,52 +336,52 @@ func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 
 // MODIFY MODE ONLY - modifies tracee's own og execve syscall args/path
 func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
-	if (orig.Path != updated.Path) {
+	if orig.Path != updated.Path {
 		// overwrites path
-		if (!redirectExecve(pid, regs, updated.Path)) {
+		if !redirectExecve(pid, regs, updated.Path) {
 			return false
 		}
 	}
 
-	if (argvEqual(orig.Argv, updated.Argv)) {
+	if argvEqual(orig.Argv, updated.Argv) {
 		return true
 	}
 
 	// modifies argv (same/more/less argv)
-	if (len(orig.Argv) == len(updated.Argv)) {
+	if len(orig.Argv) == len(updated.Argv) {
 		return patchArgvVectorInPlace(pid, regs, orig, updated)
 	}
 
-	return rebuildArgvTable(pid, regs, updated)	
+	return rebuildArgvTable(pid, regs, updated)
 }
 
 // directly edits argv in og execve cmd (only works w/ same # of argv args)
 func patchArgvVectorInPlace(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
-	scratchBase := uintptr(regs.Rsp) - 16384  // sep scratch region from path changes
+	scratchBase := uintptr(regs.Rsp) - 16384 // sep scratch region from path changes
 	offset := uintptr(0)
-	
+
 	for i := range updated.Argv {
-		if (orig.Argv[i] == updated.Argv[i]) {
+		if orig.Argv[i] == updated.Argv[i] {
 			continue
 		}
-		
+
 		addr := scratchBase + offset
-		if (!writeCString(pid, addr, updated.Argv[i])) {
+		if !writeCString(pid, addr, updated.Argv[i]) {
 			slog.Error("failed to write patched argv string", "pid", pid, "index", i)
 			return false
 		}
-		
+
 		slot := uintptr(regs.Rsi) + uintptr(i)*8
 		var p [8]byte
 		binary.LittleEndian.PutUint64(p[:], uint64(addr))
-		
+
 		_, err := syscall.PtracePokeData(pid, slot, p[:])
-		if (err != nil) {
+		if err != nil {
 			slog.Error("failed to patch argv pointer", "pid", pid, "index", i, "err", err)
 			return false
 		}
-		
-		offset += 512  // headroom to avoid overlapping writes
+
+		offset += 512 // headroom to avoid overlapping writes
 	}
 	return true
 }
@@ -361,13 +391,13 @@ func rebuildArgvTable(pid int, regs *syscall.PtraceRegs, updated module.ExecCall
 	argvScratch := uintptr(regs.Rsp) - 16384
 
 	ptrTableAddr, ok := writeStringArray(pid, argvScratch, updated.Argv)
-	if (!ok) {
+	if !ok {
 		return false
 	}
-	
+
 	regs.Rsi = uint64(ptrTableAddr)
 	err := syscall.PtraceSetRegs(pid, regs)
-	if (err != nil) {
+	if err != nil {
 		slog.Error("failed to set regs for argv redirection", "pid", pid, "err", err)
 		return false
 	}
@@ -377,17 +407,17 @@ func rebuildArgvTable(pid int, regs *syscall.PtraceRegs, updated module.ExecCall
 // opens a compiled .so and looks up its New() constructor
 func loadModule(path string) (module.Interceptor, error) {
 	p, err := plugin.Open(path)
-	if (err != nil) {
+	if err != nil {
 		return nil, fmt.Errorf("opening module: %w", err)
 	}
 
 	sym, err := p.Lookup("New")
-	if (err != nil) {
+	if err != nil {
 		return nil, fmt.Errorf("module missing New() constructor: %w", err)
 	}
 
 	newFn, ok := sym.(func() module.Interceptor)
-	if (!ok) {
+	if !ok {
 		return nil, fmt.Errorf("module New() has wrong signature, expected func() module.Interceptor")
 	}
 
@@ -408,20 +438,20 @@ func main() {
 	}
 
 	mode, command, debug, modulePath, ok := parseArgs(os.Args[1:])
-	if (!ok) {
+	if !ok {
 		return
 	}
-	if (debug) {
+	if debug {
 		logLevel.Set(slog.LevelDebug)
 	}
 	slog.Debug("pasted args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
 
 	var interceptor module.Interceptor
-	if (modulePath != "") {
+	if modulePath != "" {
 		var err error
 		interceptor, err = loadModule(modulePath)
 
-		if (err != nil) {
+		if err != nil {
 			slog.Error("failed to load module", "path", modulePath, "err", err)
 			return
 		}
@@ -429,6 +459,7 @@ func main() {
 	}
 
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
+	defer runtime.UnlockOSThread()
 
 	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
 
@@ -461,32 +492,52 @@ func main() {
 		syscall.PTRACE_O_TRACESYSGOOD
 	syscall.PtraceSetOptions(childPid, options)
 
+	// install a seccomp-BPF filter
+	// execve --> SECCOMP_RET_TRACE, everything else --> SECCOMP_RET_ALLOW
+
 	syscall.PtraceSyscall(childPid, 0)
 
 	for {
 		// wait for event from any child (-1)
 		pid, err := syscall.Wait4(-1, &status, 0, nil)
-		if (err != nil) { // traced all processes inc. fork/clone
+		if err != nil { // traced all processes inc. fork/clone
 			slog.Info("No traced processes left")
 			break
 		}
 
-		if (status.Exited() || status.Signaled()) { // cur pid died/ended/exited -> cont. to next
+		if status.Exited() || status.Signaled() { // cur pid died/ended/exited -> cont. to next
 			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
 		}
 
 		sig := status.StopSignal()
 
-		if (sig == syscall.SIGTRAP|0x80) { // syscall enter/exit boundary
+		if sig == syscall.SIGTRAP|0x80 { // syscall enter/exit boundary
 			// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
 			if (syscall.PtraceGetRegs(pid, &regs)) == nil {
 				if regs.Orig_rax == 59 && int64(regs.Rax) == -38 { // 59 filters for execve, -38 filters for only entry
-					
+
 					path := readCString(pid, uintptr(regs.Rdi))
+
+					// checks if program is a setuid binary, if it is then detach ptracer
+					isSetuid, err := IsSetUidBinary(pid, path)
+					if (err != nil || isSetuid) {
+						if (err != nil) {
+							slog.Error("failed to check setuid bit", "pid", pid, "path", path, "err", err)
+						} else {
+							slog.Info("detaching from setuid tracee", "pid", pid)
+							detachErr := syscall.PtraceDetach(pid)
+							if (detachErr != nil) {
+								slog.Error("failed to detach from setuid tracee", "pid", pid, "err", detachErr)
+							}
+							continue  // skips step 4
+						}
+					}
+
 					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
 					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
-					
+
+
 					slog.Info("execve",
 						"proc", procName(pid),
 						"pid", pid,
@@ -503,44 +554,44 @@ func main() {
 					changed := false
 
 					// switch modules
-					if (interceptor != nil) {
+					if interceptor != nil {
 						newCall, ch := interceptor.Transform(orig)
 
-						if (ch) {
+						if ch {
 							updated = newCall
 							changed = true
 						}
 					}
 
 					// everytime thers a gcc cmd, duplicate the cmd then modify it
-					if (strings.HasSuffix(path, "cc")) {
+					if strings.HasSuffix(path, "cc") {
 						slog.Debug("cc exec detected", "path", path)
 						present, newArgv := modifyArgvCmd(updated.Argv, "-o")
-						
-						if (present) {
+
+						if present {
 							updated.Argv = newArgv
 							changed = true
 						}
 					}
 
-					if (changed) {
+					if changed {
 						switch mode {
-							case ModeModify:
-								if (applyExecCallPatch(pid, &regs, orig, updated)) {
-									slog.Info("modify: modified tracee's original execve", "pid", pid)
-								}
+						case ModeModify:
+							if applyExecCallPatch(pid, &regs, orig, updated) {
+								slog.Info("modify: modified tracee's original execve", "pid", pid)
+							}
 
-							case ModeNoModify:
-								slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
-								runModifiedCmd(pid, updated)
+						case ModeNoModify:
+							slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
+							runModifiedCmd(pid, updated)
 
-							case ModeNoModifyDrop:
-								slog.Info("nomodify-drop: running modified cmd, drops og execve", "pid", pid)
-								runModifiedCmd(pid, updated)
+						case ModeNoModifyDrop:
+							slog.Info("nomodify-drop: running modified cmd, drops og execve", "pid", pid)
+							runModifiedCmd(pid, updated)
 
-								if (redirectExecve(pid, &regs, droppedExecPath)) {
-									slog.Debug("dropped og execve", "pid", pid)
-								}
+							if redirectExecve(pid, &regs, droppedExecPath) {
+								slog.Debug("dropped og execve", "pid", pid)
+							}
 						}
 					}
 				}
