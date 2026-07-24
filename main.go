@@ -562,27 +562,23 @@ func main() {
 							changed = true
 						}
 					}
-
-					// everytime thers a gcc cmd, duplicate the cmd then modify it
-					if strings.HasSuffix(path, "cc") {
-						slog.Debug("cc exec detected", "path", path)
-						present, newArgv := modifyArgvCmd(updated.Argv, "-o")
-
-						if present {
-							updated.Argv = newArgv
-							changed = true
-						}
-					}
-
+					
 					if changed {
 						switch mode {
 						case ModeModify:
 							if applyExecCallPatch(pid, &regs, orig, updated) {
 								slog.Info("modify: modified tracee's original execve", "pid", pid)
 							}
-
+							
 						case ModeNoModify:
 							slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
+							// everytime thers a ModeNoModify cmd, duplicate the cmd then modify it
+							present, newArgv := modifyArgvCmd(updated.Argv, "-o")
+		
+							if present {
+								updated.Argv = newArgv
+								changed = true
+							}
 							runModifiedCmd(pid, updated)
 
 						case ModeNoModifyDrop:
