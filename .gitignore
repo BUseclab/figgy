@@ -1,0 +1,14 @@
+# ignore everything
+*
+
+# do not ignore the .gitignore file itself
+!.gitignore
+
+# Allow specific files explicitly
+module/*
+tests/*
+!main.go
+!README.md
+!go.mod
+!go.sum
+!LICENSE
