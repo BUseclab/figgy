@@ -14,3 +14,5 @@ wrapper/*
 !go.mod
 !go.sum
 !LICENSE
+!*.sh
+!*.txt
