@@ -1,15 +1,15 @@
-CC ?= gcc
-CFLAGS = -Wall -g
-# CFLAGS = -g
-# CFLAGS = 
-TARGETS = hello_exe
+BIN := main
+WRAPPER := execwrap
 
-.PHONY: all clean test help
+.PHONY: all clean
 
-all: $(TARGETS)
+all: $(BIN) $(WRAPPER)
 
-hello_exe: tests/hello.c
-	$(CC) $(CFLAGS) -o hello_exe tests/hello.c
+$(BIN):
+	go build -o $(BIN) .
+
+$(WRAPPER): wrapper/execwrap.c
+	gcc -O2 -Wall -Wextra -o $(WRAPPER) wrapper/execwrap.c
 
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f $(BIN) $(WRAPPER)

@@ -7,8 +7,10 @@
 # Allow specific files explicitly
 module/*
 tests/*
+wrapper/*
 !main.go
 !README.md
+!Makefile
 !go.mod
 !go.sum
 !LICENSE

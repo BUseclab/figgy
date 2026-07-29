@@ -50,7 +50,16 @@ const (
 
 const droppedExecPath = "/nonexistent-dropped-by-interposer"
 
+// const wrapperPath = "./execwrap"
+
+const (
+	ptraceOTraceSeccomp = 0x80
+	ptraceEventSeccomp = 7
+)
+
 var logLevel = new(slog.LevelVar)
+
+var numExecve uint64 = 0
 
 // ======================================== QoL Functions ======================================== //
 func setupLogging() {
@@ -72,12 +81,13 @@ func setupLogging() {
 // ======================================== start of STEP 1 FUNCTIONS ========================================  //
 
 // parses the flags + commands (args) from the user command
-func parseArgs(args []string) (string, []string, bool, string, bool) {
+func parseArgs(args []string) (string, []string, bool, string, bool, bool) {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 
 	modeFlag := fs.String("mode", ModeNoModify, "exec modes: modify | nomodify | nomodify-drop")
 	debugFlag := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
 	moduleFlag := fs.String("module", "", "path to a compiled .so module implementing module.Interceptor")
+	seccompFlag := fs.Bool("seccomp", false, "use a seccomp-BPF filter for execve syscalls")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: main [--mode modify{nomodify|nomodify-drop}] [--debug] [--module path.so] -- <cmd> [args...]\n")
@@ -86,22 +96,36 @@ func parseArgs(args []string) (string, []string, bool, string, bool) {
 
 	err := fs.Parse(args)
 	if err != nil {
-		return "", nil, false, "", false
+		return "", nil, false, "", false, false
 	}
 
 	if *modeFlag != ModeModify && *modeFlag != ModeNoModify && *modeFlag != ModeNoModifyDrop {
 		fmt.Fprintf(os.Stderr, "invalid --mode %q\n", *modeFlag)
 		fs.Usage()
-		return "", nil, false, "", false
+		return "", nil, false, "", false, false
 	}
 
 	command := fs.Args()
 	if len(command) == 0 {
 		fs.Usage()
-		return "", nil, false, "", false
+		return "", nil, false, "", false, false
 	}
 
-	return *modeFlag, command, *debugFlag, *moduleFlag, true
+	return *modeFlag, command, *debugFlag, *moduleFlag, *seccompFlag, true
+}
+
+func resolveWrapperPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolving own executable path: %w", err)
+	}
+	
+	real, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		real = exe
+	}
+
+	return filepath.Join(filepath.Dir(real), "execwrap"), nil
 }
 
 // ======================================== end of STEP 1 FUNCTIONS ======================================== //
@@ -420,8 +444,87 @@ func loadModule(path string) (module.Interceptor, error) {
 	if !ok {
 		return nil, fmt.Errorf("module New() has wrong signature, expected func() module.Interceptor")
 	}
-
+	
 	return newFn(), nil
+}
+
+func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptor module.Interceptor) (bool) {
+	path := readCString(pid, uintptr(regs.Rdi))
+
+	// checks if program is a setuid binary, if it is then detach ptracer
+	isSetuid, err := IsSetUidBinary(pid, path)
+	if (err != nil || isSetuid) {
+		if (err != nil) {
+			slog.Error("failed to check setuid bit", "pid", pid, "path", path, "err", err)
+		} else {
+			slog.Info("detaching from setuid tracee", "pid", pid)
+			detachErr := syscall.PtraceDetach(pid)
+			if (detachErr != nil) {
+				slog.Error("failed to detach from setuid tracee", "pid", pid, "err", detachErr)
+			}
+			return true  // skips step 4
+		}
+	}
+
+	argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
+	envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
+
+
+	slog.Info("execve",
+		"proc", procName(pid),
+		"pid", pid,
+		"path", path,
+		"argv", argv,
+		"envc", envc,
+	)
+	slog.Debug("first few env vars", "env", envv[:min(5, len(envv))])
+
+	numExecve++
+	// ############################## STEP 4. Modify execve args 4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4 FOUR FOUR FOUR FOUR FOUR FOUR
+
+	orig := module.ExecCall{Path: path, Argv: argv, Envp: envv}
+	updated := orig
+	changed := false
+
+	// switch modules
+	if interceptor != nil {
+		newCall, ch := interceptor.Transform(orig)
+
+		if ch {
+			updated = newCall
+			changed = true
+		}
+	}
+	
+	if changed {
+		switch mode {
+		case ModeModify:
+			if applyExecCallPatch(pid, regs, orig, updated) {
+				slog.Info("modify: modified tracee's original execve", "pid", pid)
+			}
+			
+		case ModeNoModify:
+			slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
+			// everytime thers a ModeNoModify cmd, duplicate the cmd then modify it
+			present, newArgv := modifyArgvCmd(updated.Argv, "-o")
+
+			if present {
+				updated.Argv = newArgv
+				changed = true
+			}
+			runModifiedCmd(pid, updated)
+
+		case ModeNoModifyDrop:
+			slog.Info("nomodify-drop: running modified cmd, drops og execve", "pid", pid)
+			runModifiedCmd(pid, updated)
+
+			if redirectExecve(pid, regs, droppedExecPath) {
+				slog.Debug("dropped og execve", "pid", pid)
+			}
+		}
+	}
+
+	return false
 }
 
 // ======================================== end of STEP 4 FUNCTIONS ======================================== //
@@ -437,7 +540,7 @@ func main() {
 		return
 	}
 
-	mode, command, debug, modulePath, ok := parseArgs(os.Args[1:])
+	mode, command, debug, modulePath, seccomp, ok := parseArgs(os.Args[1:])
 	if !ok {
 		return
 	}
@@ -445,6 +548,23 @@ func main() {
 		logLevel.Set(slog.LevelDebug)
 	}
 	slog.Debug("pasted args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
+
+
+	var wrapperPath string
+	if seccomp {
+		var err error
+		wrapperPath, err = resolveWrapperPath()
+		if err != nil {
+			slog.Error("failed to resolve seccomp wrapper path", "err", err)
+			return
+		}
+
+		info, statErr := os.Stat(wrapperPath)
+		if statErr != nil || info.Mode()&0111 == 0 {
+			slog.Error("seccomp wrapper missing or not executable", "path", wrapperPath, "err", statErr)
+			return
+		}
+	}
 
 	var interceptor module.Interceptor
 	if modulePath != "" {
@@ -463,7 +583,14 @@ func main() {
 
 	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
 
-	cmd := exec.Command(command[0], command[1:]...)
+	var cmd *exec.Cmd
+	if seccomp {
+		wrapperArgs := append([]string{command[0]}, command[1:]...)
+		cmd = exec.Command(wrapperPath, wrapperArgs...)
+	} else {
+		cmd = exec.Command(command[0], command[1:]...)
+	}
+	// cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -490,115 +617,90 @@ func main() {
 		syscall.PTRACE_O_TRACECLONE |
 		// changes the 7th bit to differentiate syscall start/stop vs other sigtraps
 		syscall.PTRACE_O_TRACESYSGOOD
+	if seccomp {
+		options |= ptraceOTraceSeccomp
+	}
 	syscall.PtraceSetOptions(childPid, options)
 
 	// install a seccomp-BPF filter
 	// execve --> SECCOMP_RET_TRACE, everything else --> SECCOMP_RET_ALLOW
 
-	syscall.PtraceSyscall(childPid, 0)
+	if seccomp {
+		syscall.PtraceCont(childPid, 0)
+	} else {
+		syscall.PtraceSyscall(childPid, 0)
+	}
 
+	var stopCount int
 	for {
 		// wait for event from any child (-1)
 		pid, err := syscall.Wait4(-1, &status, 0, nil)
+
+		stopCount++
+		
 		if err != nil { // traced all processes inc. fork/clone
 			slog.Info("No traced processes left")
 			break
 		}
-
+		
 		if status.Exited() || status.Signaled() { // cur pid died/ended/exited -> cont. to next
 			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
 		}
-
-		sig := status.StopSignal()
-
-		if sig == syscall.SIGTRAP|0x80 { // syscall enter/exit boundary
-			// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
-			if (syscall.PtraceGetRegs(pid, &regs)) == nil {
-				if regs.Orig_rax == 59 && int64(regs.Rax) == -38 { // 59 filters for execve, -38 filters for only entry
-
-					path := readCString(pid, uintptr(regs.Rdi))
-
-					// checks if program is a setuid binary, if it is then detach ptracer
-					isSetuid, err := IsSetUidBinary(pid, path)
-					if (err != nil || isSetuid) {
-						if (err != nil) {
-							slog.Error("failed to check setuid bit", "pid", pid, "path", path, "err", err)
-						} else {
-							slog.Info("detaching from setuid tracee", "pid", pid)
-							detachErr := syscall.PtraceDetach(pid)
-							if (detachErr != nil) {
-								slog.Error("failed to detach from setuid tracee", "pid", pid, "err", detachErr)
-							}
-							continue  // skips step 4
-						}
-					}
-
-					argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
-					envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
-
-
-					slog.Info("execve",
-						"proc", procName(pid),
-						"pid", pid,
-						"path", path,
-						"argv", argv,
-						"envc", envc,
-					)
-					slog.Debug("first few env vars", "env", envv[:min(5, len(envv))])
-
-					// ############################## STEP 4. Modify execve args 4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4 FOUR FOUR FOUR FOUR FOUR FOUR
-
-					orig := module.ExecCall{Path: path, Argv: argv, Envp: envv}
-					updated := orig
-					changed := false
-
-					// switch modules
-					if interceptor != nil {
-						newCall, ch := interceptor.Transform(orig)
-
-						if ch {
-							updated = newCall
-							changed = true
-						}
-					}
-					
-					if changed {
-						switch mode {
-						case ModeModify:
-							if applyExecCallPatch(pid, &regs, orig, updated) {
-								slog.Info("modify: modified tracee's original execve", "pid", pid)
-							}
-							
-						case ModeNoModify:
-							slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
-							// everytime thers a ModeNoModify cmd, duplicate the cmd then modify it
-							present, newArgv := modifyArgvCmd(updated.Argv, "-o")
 		
-							if present {
-								updated.Argv = newArgv
-								changed = true
-							}
-							runModifiedCmd(pid, updated)
-
-						case ModeNoModifyDrop:
-							slog.Info("nomodify-drop: running modified cmd, drops og execve", "pid", pid)
-							runModifiedCmd(pid, updated)
-
-							if redirectExecve(pid, &regs, droppedExecPath) {
-								slog.Debug("dropped og execve", "pid", pid)
-							}
-						}
+		sig := status.StopSignal()
+		cause := status.TrapCause()
+		
+		// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
+		
+		// numExecve++
+		switch {
+		// with seccomp
+		case seccomp && cause == ptraceEventSeccomp:
+    		slog.Debug("seccomp-trapped execve", "pid", pid)
+			if syscall.PtraceGetRegs(pid, &regs) == nil && (regs.Orig_rax == 59 || regs.Orig_rax == 322) {
+				detached := handleExecve(pid, &regs, mode, interceptor)
+				if detached {
+					continue
+				}
+			}
+			syscall.PtraceCont(pid, 0)
+		
+		// without seccomp
+		case !seccomp && sig == syscall.SIGTRAP|0x80:
+			if syscall.PtraceGetRegs(pid, &regs) == nil {
+				if (regs.Orig_rax == 59 || regs.Orig_rax == 322) && int64(regs.Rax) == -38 {
+					detached := handleExecve(pid, &regs, mode, interceptor)
+					if detached {
+						continue
 					}
 				}
 			}
 			syscall.PtraceSyscall(pid, 0)
-		} else if status.TrapCause() != -1 { // fork event stops on parent (child created) -> resume it
-			syscall.PtraceSyscall(pid, 0)
-		} else if sig == syscall.SIGTRAP || sig == syscall.SIGSTOP { // other sigtraps/sigstops
-			syscall.PtraceSyscall(pid, 0)
-		} else { // signal aimed @ tracee -> resume + reinject
-			syscall.PtraceSyscall(pid, int(sig))
+			
+		case cause != -1:
+			if seccomp {
+				syscall.PtraceCont(pid, 0)
+			} else {
+				syscall.PtraceSyscall(pid, 0)
+			}
+				
+		case sig == syscall.SIGTRAP || sig == syscall.SIGSTOP:
+			if seccomp {
+				syscall.PtraceCont(pid, 0)
+			} else {
+				syscall.PtraceSyscall(pid, 0)
+			}
+				
+		default:
+			if seccomp {
+				syscall.PtraceCont(pid, int(sig))
+			} else {
+				syscall.PtraceSyscall(pid, int(sig))
+			}
+			}
 		}
-	}
+	slog.Info("total ptrace stops", "count", stopCount)
+	slog.Info("Num execve calls", "calls", numExecve)
 }
+			
