@@ -501,6 +501,26 @@ func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptor mo
 		case ModeModify:
 			if applyExecCallPatch(pid, regs, orig, updated) {
 				slog.Info("modify: modified tracee's original execve", "pid", pid)
+
+				// read back what's now actually in tracee memory, post-patch
+				verifyPath := readCString(pid, uintptr(regs.Rdi))
+				verifyArgv, verifyArgc := readAndCountStringArray(pid, uintptr(regs.Rsi))
+
+				slog.Debug("post-patch readback",
+					"pid", pid,
+					"path", verifyPath,
+					"argv", verifyArgv,
+					"argc", verifyArgc,
+					"expected_path", updated.Path,
+					"expected_argv", updated.Argv,
+				)
+
+				if verifyPath != updated.Path {
+					slog.Error("PATCH MISMATCH: path", "pid", pid, "got", verifyPath, "want", updated.Path)
+				}
+				if !argvEqual(verifyArgv, updated.Argv) {
+					slog.Error("PATCH MISMATCH: argv", "pid", pid, "got", verifyArgv, "want", updated.Argv)
+				}
 			}
 			
 		case ModeNoModify:
