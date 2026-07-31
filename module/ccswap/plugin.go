@@ -36,13 +36,13 @@ func (m *compilerSwap) Name() string {
 var cxxBasenames = map[string]bool {
 	"g++": true,
 	"c++": true,
-	"clang++": true,
+	//"clang++": true,
 }
 
 var ccBasenames = map[string]bool {
 	"gcc": true,
 	"cc": true,
-	"clang": true,
+	//"clang": true,
 }
 
 // strips trailing "-version" suffix (e.g. gcc-14 --> gcc)
