@@ -334,6 +334,120 @@ func argvEqual(a, b []string) bool {
 	return true
 }
 
+// START OF SCRATCH MEMORY FUNCTIONS
+
+const (
+	sysMmap = 9
+	protReadWrite = 0x3
+	mapPrivateAnon = 0x22
+	pageSize = 4096
+)
+
+func injectMmap(pid int, regs *syscall.PtraceRegs, size uintptr) (uintptr, bool) {
+	// save original registers
+	origNr := regs.Orig_rax
+	origRdi, origRsi, origRdx := regs.Rdi, regs.Rsi, regs.Rdx
+	origR10, origR8, origR9 := regs.R10, regs.R8, regs.R9
+	origRip := regs.Rip
+
+	// round requested size to 4096 bytes
+	allocSize := (size + pageSize - 1) &^ (pageSize - 1)
+	if allocSize == 0 {
+		allocSize = pageSize
+	}
+
+	// format new registers according to x86_64 linux calling conventions
+	mmapRegs := *regs
+	mmapRegs.Orig_rax = sysMmap
+	mmapRegs.Rax = sysMmap
+	mmapRegs.Rdi = 0  // addr = NULL --> kernel pikcs
+	mmapRegs.Rsi = uint64(allocSize)  // len
+	mmapRegs.Rdx = protReadWrite  // prot
+	mmapRegs.R10 = mapPrivateAnon  // flags
+	mmapRegs.R8 = ^uint64(0)  // fd = -1
+	mmapRegs.R9 = 0  // offset
+
+	// write mmap to cpu registers
+	err := syscall.PtraceSetRegs(pid, &mmapRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to set regs for mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	// resumes syscall --> pause at mmap syscall
+	err = syscall.PtraceSyscall(pid, 0)
+	if err != nil {
+		slog.Error("injectMmap: failed to step into mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	var status syscall.WaitStatus
+	wpid, err := syscall.Wait4(pid, &status, 0, nil)
+	if err != nil || wpid != pid {
+		slog.Error("injectMmap: wait4 for mmap exit failed", "pid", pid, "err", err)
+		return 0, false
+	}
+	if status.Exited() || status.Signaled() {
+		slog.Error("injectMmap: tracee died during mmap injection", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	var afterRegs syscall.PtraceRegs
+	err = syscall.PtraceGetRegs(pid, &afterRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to read regs after mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	ret := int64(afterRegs.Rax)
+	if ret < 0 && ret > -4096 {  // neg code = err
+		slog.Error("injectMmap: mmap failed inside tracee", "pid", pid, "err", err)
+		return 0, false
+	}
+	scratchAddr := uintptr(ret)
+
+	// need to move instruciton ptr back 2 steps (size of acc x86 syscall) so target cont exec code as before
+	afterRegs.Rip = origRip - 2  
+	afterRegs.Orig_rax = origNr
+	afterRegs.Rax = origNr
+	afterRegs.Rdi = origRdi
+	afterRegs.Rsi = origRsi
+	afterRegs.Rdx = origRdx
+	afterRegs.R10 = origR10
+	afterRegs.R8 = origR8
+	afterRegs.R9 = origR9
+
+	// restore og regs
+	err = syscall.PtraceSetRegs(pid, &afterRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to restore regs post-mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	*regs = afterRegs
+	return scratchAddr, true
+}
+
+// computers bytes needed for path + argv strings (8 byte padded) + argv ptr table
+func execScratchSize(path string, argv []string) uintptr {
+	pad8 := func(n int) uintptr {
+		p := uintptr(n)
+		if p%8 != 0 {
+			p += 8 - (p % 8)
+		}
+		return p
+	}
+
+	size := pad8(len(path) + 1)  // path str
+	for _, s := range argv {  // arg strs
+		size += pad8(len(s) + 1)
+	}
+	size += uintptr(len(argv)+1) * 8  // NULL terminated ptr table
+	return size
+}
+
+// END OF SCRATCH MEMORY FUNCTIONS
+
 // overwrites pathname (Rdi) arg of execve so tracee execs a diff binary
 // argv/envp (Rsi/Rdx) not edited --> replacement sees same invocation context
 func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
@@ -360,23 +474,44 @@ func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 
 // MODIFY MODE ONLY - modifies tracee's own og execve syscall args/path
 func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
-	if orig.Path != updated.Path {
-		// overwrites path
-		if !redirectExecve(pid, regs, updated.Path) {
-			return false
-		}
-	}
+	pathChanged := orig.Path != updated.Path
+	argvChanged := !argvEqual(orig.Argv, updated.Argv)
 
-	if argvEqual(orig.Argv, updated.Argv) {
+	if !pathChanged && !argvChanged {
 		return true
 	}
 
-	// modifies argv (same/more/less argv)
-	if len(orig.Argv) == len(updated.Argv) {
-		return patchArgvVectorInPlace(pid, regs, orig, updated)
+	needed := execScratchSize(updated.Path, updated.Argv)
+	scratch, ok := injectMmap(pid, regs, needed)
+	if !ok {
+		slog.Error("failed to allocate scratch memory in tracee for exec patch", "pid", pid)
+		return false
 	}
 
-	return rebuildArgvTable(pid, regs, updated)
+	pathAddr := scratch
+	if !writeCString(pid, pathAddr, updated.Path) {
+		slog.Error("failed to write patched path", "pid", pid)
+		return false
+	}
+	pathSize := uintptr(len(updated.Path) + 1)
+	if pathSize%8 != 0 {
+		pathSize += 8 - (pathSize % 8)
+	}
+
+	argvTableAddr, ok := writeStringArray(pid, scratch+pathSize, updated.Argv)
+	if !ok {
+		slog.Error("failed to write patched argv", "pid", pid)
+		return false
+	}
+
+	regs.Rdi = uint64(pathAddr)
+	regs.Rsi = uint64(argvTableAddr)
+	err := syscall.PtraceSetRegs(pid, regs)
+	if err != nil {
+		slog.Error("failed to set regs for exec patch", "pid", pid, "err", err)
+		return false
+	}
+	return true
 }
 
 // directly edits argv in og execve cmd (only works w/ same # of argv args)
@@ -385,9 +520,9 @@ func patchArgvVectorInPlace(pid int, regs *syscall.PtraceRegs, orig, updated mod
 	offset := uintptr(0)
 
 	for i := range updated.Argv {
-		if orig.Argv[i] == updated.Argv[i] {
-			continue
-		}
+		// if orig.Argv[i] == updated.Argv[i] {
+		// 	continue
+		// }
 
 		addr := scratchBase + offset
 		if !writeCString(pid, addr, updated.Argv[i]) {

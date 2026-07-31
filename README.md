@@ -9,3 +9,7 @@ NOTE TO SELF
 
 note
 - setcap/getcao cap_dac_read_search magic removed the setuid errors triggered on line 558 (the error in the if statement)
+
+
+
+note - figgy does not work with unshare mode but works with chroot
