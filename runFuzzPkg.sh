@@ -11,7 +11,7 @@ OUTPUT_DIR="./fuzzOutput"
 SUMMARY_LOG="${OUTPUT_DIR}/summary.log"
 
 # TIME_LIMIT="60s"
-TIME_LIMIT="59m"
+TIME_LIMIT="1000m"
 
 checkInputsExist() {
     if [[ ! -f "$TARGETS_FILE" ]]; then

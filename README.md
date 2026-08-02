@@ -5,6 +5,7 @@ NOTE TO SELF
     - e.g. `./main ./write`
 - EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccsourceswap.so -- make > temp.txt 2>&1 
 - Compilation Command: go build -buildmode=plugin -o argvinject.so ./module/argvinject
+    - make argvinject.so 
 
 
 note

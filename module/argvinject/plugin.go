@@ -17,8 +17,30 @@ func (a *argvInject) Name() string {
 	return "argv-inject"
 }
 
+// looks for gcc/clang, g++/clang++, and cc
+func isTargetCompiler(path string) bool {
+	base := path
+	idx := strings.LastIndex(base, "/")
+	if idx != -1 {
+		base = base[idx+1:]
+	}
+
+	prefixes := []string{"gcc", "g++", "clang", "clang++", "cc", "c++"}
+	for _, p := range prefixes {
+		if base == p {
+			return true
+		}
+
+		// allow version suffix
+		if strings.HasPrefix(base, p+"-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
-	if (!strings.HasSuffix(call.Path, "cc") && !strings.HasSuffix(call.Path, "gcc")) {
+	if !isTargetCompiler(call.Path) {
 		return call, false
 	}
 
@@ -84,7 +106,7 @@ func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
 
 func New() module.Interceptor {
 	return &argvInject{
-		// extraArgs: []string{"-Wall", "-g"},
-		removeArgs: []string{"-g", "-Wall"},
+		extraArgs: []string{"-flto=full", "-ffat-lto-objects", "-Wl,-mllvm,-lto-embed-bitcode=optimized", "-fuse-ld=lld"},
+		// removeArgs: []string{"-g", "-Wall"},
 	}
 }
