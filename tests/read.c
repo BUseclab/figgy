@@ -1,10 +1,10 @@
 #include <unistd.h>
-#include <fcntl.h> // Required for openat
+#include <fcntl.h>
 
 int main(void) {
     char buf[16];
 
-    // Using standard wrappers instead of raw syscall(...)
+    // using standard wrappers instead of raw syscall(...)
     int fd = openat(AT_FDCWD, "/dev/zero", O_RDONLY);
     if (fd < 0) return 1;
 

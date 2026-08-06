@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"interposer/module"
+	"figgy/module"
 )
 
 // compiler-driver subprocess stages that should NOT be rewritten

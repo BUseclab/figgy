@@ -5,7 +5,7 @@ package main
 import (
 	"strings"
 
-	"interposer/module"
+	"figgy/module"
 )
 
 type argvInject struct {
@@ -110,27 +110,8 @@ func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
 
 func New() module.Interceptor {
 	return &argvInject{
-		// llvm bitcode flags:
+		// usage examples:
 		// extraArgs: []string{"-flto=full", "-ffat-lto-objects", "-Wl,-mllvm,-lto-embed-bitcode=optimized", "-fuse-ld=lld"},
-
-		// afl fuzzing flags (add to normal clang)
-		// extraArgs: []string{"-g", "-O2", "-fsanitize=fuzzer,address,undefined"},
-
-		extraArgs: []string{
-			"-fpass-plugin=/usr/lib/afl/afl-llvm-pass.so",
-			"-O3",
-			"-funroll-loops",
-			"-D__AFL_COMPILER=1",
-			"-D__AFL_HAVE_MANUAL_CONTROL=1",
-			"-fsanitize-coverage=trace-pc-guard",
-			"-fsanitize=fuzzer,address,undefined",
-			"-Wl../../../fuzzerWrapper.o",
-			// "-Wl,/usr/lib/afl/afl-compiler-rt.o",
-			"-g",
-			"-O2",
-		},
-
-		// extraArgs: []string{"-g", "-O2", "-fsanitize=fuzzer,address,undefined", "../../../fuzzerWrapper.cc", "-o fuzzerWrapper"},
 
 		// removeArgs: []string{"-g", "-Wall"},
 	}

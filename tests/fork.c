@@ -1,8 +1,3 @@
-// each test is a c program
-// write a c program that does write
-// one that does fork
-// one that does a fork then execve another program that does the write
-
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <sys/wait.h>

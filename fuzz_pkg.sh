@@ -10,11 +10,11 @@ cd "./fuzzLF/${pkg}"
 
 apt source $pkg
 
-export CC_SWAP_TARGET="clang"
-export CXX_SWAP_TARGET="clang++"
+export CC_SWAP_TARGET="afl-clang-fast"  # change as needed
+export CXX_SWAP_TARGET="afl-clang-fast++"  # change as needed
 
 DEB_BUILD_OPTIONS="nocheck nostrip parallel=$(nproc)" \
-    ${PROJECT_ROOT}/main -mode=modify -module ${PROJECT_ROOT}/ccswap.so -module ${PROJECT_ROOT}/argvinject.so -- \
+    ${PROJECT_ROOT}/figgy -mode=modify -module ${PROJECT_ROOT}/ccswap.so -- \
     sbuild -v -d trixie --arch-any --no-arch-all --no-source *.dsc \
     --chroot-setup-commands="apt update; DEBIAN_FRONTEND=noninteractive apt install -y afl++;" \
     --finished-build-commands="exe=\$(find /build -type f -executable -name ${pkg} 2>/dev/null | head -n 1); echo \$exe;\

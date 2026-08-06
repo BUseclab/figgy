@@ -1,4 +1,4 @@
-# Makefile_Interposer
+# Makefile_Figgy
 
 NOTE TO SELF
 - to run the test files, the cmd format must be `./main ./[compiled c file name]`

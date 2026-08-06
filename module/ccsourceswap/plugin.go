@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	"interposer/module" // change to acc module path (see go.mod)
+	"figgy/module" // change to acc module path (see go.mod)
 )
 
 type ccSourceSwap struct {
@@ -16,7 +16,7 @@ func (c *ccSourceSwap) Name() string {
 }
 
 func (c *ccSourceSwap) Transform(call module.ExecCall) (module.ExecCall, bool) {
-	if (!strings.HasSuffix(call.Path, "cc") && !strings.HasSuffix(call.Path, "gcc")) {
+	if !strings.HasSuffix(call.Path, "cc") && !strings.HasSuffix(call.Path, "gcc") {
 		return call, false
 	}
 
@@ -25,14 +25,14 @@ func (c *ccSourceSwap) Transform(call module.ExecCall) (module.ExecCall, bool) {
 
 	changed := false
 	for i, a := range newArgv {
-		if (strings.HasSuffix(a, ".c") && !strings.HasPrefix(a, "-")) {
+		if strings.HasSuffix(a, ".c") && !strings.HasPrefix(a, "-") {
 			newArgv[i] = c.newSource
 			changed = true
-			break  // only swap 1st src fiel found
+			break // only swap 1st src fiel found
 		}
 	}
 
-	if (!changed) {
+	if !changed {
 		return call, false
 	}
 	call.Argv = newArgv
@@ -43,7 +43,7 @@ func (c *ccSourceSwap) Transform(call module.ExecCall) (module.ExecCall, bool) {
 // reads target from env var --> no need to recompile module
 func New() module.Interceptor {
 	src := os.Getenv("CC_SOURCE_SWAP_TARGET")
-	if (src == "") {
+	if src == "" {
 		src = "replacement.c"
 	}
 	return &ccSourceSwap{newSource: src}

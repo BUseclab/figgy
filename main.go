@@ -1,25 +1,3 @@
-// (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) (❁´◡`❁) //
-// - (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ (●'◡'●) ╰(*°▽°*)╯ - //
-
-// EXAMPLE USAGE
-// EXAMPLE COMMAND === CC_SOURCE_SWAP_TARGET=./tests/write.c ./main --debug --module ccswap.so -- make > temp.txt 2>&1
-
-// Find actual arguments (execve args)
-// execve signature: int execve(const char *pathname, char *const argv[], char *const envp[]);
-/*
-	- Sys Call ID/Ret Val - %rax
-	- Arg1 - %rdi
-	- Arg2 - %rsi
-	- Arg3 - %rdx
-	- Arg4 - %r10
-	- Arg5 - %r8
-	- Arg6 - %r9
-
-	rdi --> *pathname
-	rsi --> *argv (arg vector array)
-	rdx --> *envp (env var array)
-*/
-
 package main
 
 import (
@@ -35,7 +13,7 @@ import (
 	"strings"
 	"syscall"
 
-	"interposer/module"
+	"figgy/module"
 )
 
 // ======================================== Global Vars & Constants ======================================== //
@@ -45,7 +23,7 @@ const (
 	ModeNoModifyDrop = "nomodify-drop"
 )
 
-const droppedExecPath = "/nonexistent-dropped-by-interposer"
+const droppedExecPath = "/nonexistent-dropped-by-figgy"
 
 const (
 	ptraceOTraceSeccomp = 0x80
@@ -149,10 +127,10 @@ func resolveWrapperPath() (string, error) {
 
 // ======================================== start of STEP 2 FUNCTIONS ======================================== //
 
-// HEKPER FUNC: get process name
+// get process name
 func procName(pid int) string {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil { // process gone/unreachable :o
+	if err != nil { // process gone/unreachable
 		return "?"
 	}
 	return strings.TrimSpace(string(b)) // bytes-->string
@@ -172,7 +150,7 @@ func readWord(pid int, addr uintptr) (uint64, bool) { // retval: 8byte word, tru
 	return binary.LittleEndian.Uint64(buf), true // x86_64 ubuntu runs little endian natively
 }
 
-// (rdi - pathname) follow pointer to NULl terminated C-string + read it
+// follow pointer to NULL terminated C-string in a different memory space + read it
 func readCString(pid int, addr uintptr) string { // can't pass in pointer mem addr bc its a new/separate memory space
 	var b []byte
 	for {
@@ -183,7 +161,7 @@ func readCString(pid int, addr uintptr) string { // can't pass in pointer mem ad
 		for i := 0; i < 8; i++ {
 			c := byte(word >> (8 * i)) // pulls each byte out of word (L 8bit shift)
 			if c == 0 {
-				return string(b) // hit NUL terminator --> DONE YAYAYAYAY :o
+				return string(b) // hit NUL terminator
 			}
 			b = append(b, c)
 		}
@@ -192,8 +170,7 @@ func readCString(pid int, addr uintptr) string { // can't pass in pointer mem ad
 	return string(b)
 }
 
-// (rsi - argv) read NULL-terminated array of string pointers (argv/envp)
-// (rdx - envp) count entries in a NULL-terminated ptr array w/out reading strings
+// read and count entries in a NULL-terminated ptr array in a different memory space
 func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 	var out []string
 	count := 0
@@ -209,6 +186,7 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 	return out, count
 }
 
+// resolves a relative path in the context of the tracee's current working directory
 func resolveTraceePath(pid int, path string) string {
 	if filepath.IsAbs(path) {
 		return path
@@ -222,8 +200,9 @@ func resolveTraceePath(pid int, path string) string {
 	return filepath.Join(cwd, path)
 }
 
+// checks if a binary has the setuid or setgid bit set
 func IsSetUidBinary(pid int, path string) (bool, error) {
-	info, err := os.Stat(resolveTraceePath(pid, path)) // needs superuser perms to check file info
+	info, err := os.Stat(resolveTraceePath(pid, path))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -239,7 +218,7 @@ func IsSetUidBinary(pid int, path string) (bool, error) {
 
 // ======================================== start of STEP 4 FUNCTIONS ======================================== //
 
-// modifies the argv command and returns success/unsuccess + the new argv command
+// modifies the value after the flag passed in, returns true if modified, false if not found
 func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
 	newArgv := make([]string, len(ogArgv))
 	copy(newArgv, ogArgv)
@@ -259,6 +238,7 @@ func modifyArgvCmd(ogArgv []string, flagName string) (bool, []string) {
 	return false, nil
 }
 
+// spawns a new process with the modified execve args, runs it, and waits for it to finish
 func runModifiedCmd(pid int, call module.ExecCall) {
 	slog.Info("spawning duplicate process", "path", call.Path, "argv", call.Argv, "envc", len(call.Envp))
 
@@ -283,6 +263,7 @@ func runModifiedCmd(pid int, call module.ExecCall) {
 	}
 }
 
+// writes a NULL terminated C-string into tracee memory
 func writeCString(pid int, addr uintptr, s string) bool {
 	b := append([]byte(s), 0)
 
@@ -351,7 +332,7 @@ func argvEqual(a, b []string) bool {
 	return true
 }
 
-// START OF SCRATCH MEMORY FUNCTIONS
+// ======================================== START OF SCRATCH MEMORY FUNCTIONS ======================================== //
 
 const (
 	sysMmap        = 9
@@ -360,6 +341,7 @@ const (
 	pageSize       = 4096
 )
 
+// injects a scratch memory region into the tracee process using mmap syscall, returns addr of scratch mem
 func injectMmap(pid int, regs *syscall.PtraceRegs, size uintptr) (uintptr, bool) {
 	// save original registers
 	origNr := regs.Orig_rax
@@ -445,7 +427,7 @@ func injectMmap(pid int, regs *syscall.PtraceRegs, size uintptr) (uintptr, bool)
 	return scratchAddr, true
 }
 
-// computers bytes needed for path + argv strings (8 byte padded) + argv ptr table
+// computes bytes needed for path + argv strings (8 byte padded) + argv ptr table
 func execScratchSize(path string, argv []string) uintptr {
 	pad8 := func(n int) uintptr {
 		p := uintptr(n)
@@ -463,10 +445,10 @@ func execScratchSize(path string, argv []string) uintptr {
 	return size
 }
 
-// END OF SCRATCH MEMORY FUNCTIONS
+// ======================================== END OF SCRATCH MEMORY FUNCTIONS ======================================== //
 
-// overwrites pathname (Rdi) arg of execve so tracee execs a diff binary
-// argv/envp (Rsi/Rdx) not edited --> replacement sees same invocation context
+// overwrites pathname arg of execve so tracee execs a diff binary
+// argv/envp not edited --> replacement sees same invocation context
 func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 	if len(newPath) > 4096 {
 		slog.Error("replacement path too long", "pid", pid, "len", len(newPath))
@@ -531,51 +513,6 @@ func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.
 	return true
 }
 
-// directly edits argv in og execve cmd (only works w/ same # of argv args)
-func patchArgvVectorInPlace(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
-	scratchBase := uintptr(regs.Rsp) - 16384 // sep scratch region from path changes
-	offset := uintptr(0)
-
-	for i := range updated.Argv {
-		addr := scratchBase + offset
-		if !writeCString(pid, addr, updated.Argv[i]) {
-			slog.Error("failed to write patched argv string", "pid", pid, "index", i)
-			return false
-		}
-
-		slot := uintptr(regs.Rsi) + uintptr(i)*8
-		var p [8]byte
-		binary.LittleEndian.PutUint64(p[:], uint64(addr))
-
-		_, err := syscall.PtracePokeData(pid, slot, p[:])
-		if err != nil {
-			slog.Error("failed to patch argv pointer", "pid", pid, "index", i, "err", err)
-			return false
-		}
-
-		offset += 512 // headroom to avoid overlapping writes
-	}
-	return true
-}
-
-// dir edits og execve argv --> inc/dec size of argv (only works for diff # of argv args)
-func rebuildArgvTable(pid int, regs *syscall.PtraceRegs, updated module.ExecCall) bool {
-	argvScratch := uintptr(regs.Rsp) - 16384
-
-	ptrTableAddr, ok := writeStringArray(pid, argvScratch, updated.Argv)
-	if !ok {
-		return false
-	}
-
-	regs.Rsi = uint64(ptrTableAddr)
-	err := syscall.PtraceSetRegs(pid, regs)
-	if err != nil {
-		slog.Error("failed to set regs for argv redirection", "pid", pid, "err", err)
-		return false
-	}
-	return true
-}
-
 // opens a compiled .so and looks up its New() constructor
 func loadModule(path string) (module.Interceptor, error) {
 	p, err := plugin.Open(path)
@@ -596,6 +533,7 @@ func loadModule(path string) (module.Interceptor, error) {
 	return newFn(), nil
 }
 
+// loads all modules from the given paths and returns a slice of Interceptor instances
 func loadModules(paths []string) ([]module.Interceptor, error) {
 	interceptors := make([]module.Interceptor, 0, len(paths))
 	for _, path := range paths {
@@ -608,6 +546,7 @@ func loadModules(paths []string) ([]module.Interceptor, error) {
 	return interceptors, nil
 }
 
+// handles execve syscall, applies module transformations, and modifies tracee's execve args if needed
 func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptors []module.Interceptor) bool {
 	path := readCString(pid, uintptr(regs.Rdi))
 
@@ -639,7 +578,7 @@ func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptors [
 	slog.Debug("first few env vars", "env", envv[:min(5, len(envv))])
 
 	numExecve++
-	// ############################## STEP 4. Modify execve args 4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4-4 FOUR FOUR FOUR FOUR FOUR FOUR
+	// ======================================== STEP 4. Modify execve args ======================================== //
 
 	orig := module.ExecCall{Path: path, Argv: argv, Envp: envv}
 	updated := orig
@@ -717,7 +656,7 @@ func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptors [
 
 // ======================================== end of STEP 4 FUNCTIONS ======================================== //
 
-// MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN MAIN //
+// ======================================== MAIN ======================================== //
 func main() {
 	setupLogging()
 
@@ -770,7 +709,7 @@ func main() {
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
 	defer runtime.UnlockOSThread()
 
-	// ############################## STEP 1. Fork the process 1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1 ONE ONE ONE ONE ONE ONE
+	// ======================================== STEP 1. Fork the process ======================================== //
 
 	var cmd *exec.Cmd
 	if seccomp {
@@ -779,12 +718,11 @@ func main() {
 	} else {
 		cmd = exec.Command(command[0], command[1:]...)
 	}
-	// cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true, // equiv of ptrace(PTRACE_TRACEME) in C + stops at exec
+		Ptrace: true,
 	}
 
 	// fork + exec child
@@ -798,7 +736,7 @@ func main() {
 	var status syscall.WaitStatus // wait res
 	var regs syscall.PtraceRegs   // reg snapshot
 
-	// ############################## STEP 2. Trace syscall 2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2-2 TWO TWO TWO TWO TWO TWO
+	// ======================================== STEP 2. Trace syscall ======================================== //
 	syscall.Wait4(childPid, &status, 0, nil) // catch child init. stop
 
 	options := syscall.PTRACE_O_TRACEFORK | // auto attach + stop any new child
@@ -810,9 +748,6 @@ func main() {
 		options |= ptraceOTraceSeccomp
 	}
 	syscall.PtraceSetOptions(childPid, options)
-
-	// install a seccomp-BPF filter
-	// execve --> SECCOMP_RET_TRACE, everything else --> SECCOMP_RET_ALLOW
 
 	if seccomp {
 		syscall.PtraceCont(childPid, 0)
@@ -840,9 +775,8 @@ func main() {
 		sig := status.StopSignal()
 		cause := status.TrapCause()
 
-		// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
+		// ======================================== STEP 3. Parse execve args ======================================== //
 
-		// numExecve++
 		switch {
 		// with seccomp
 		case seccomp && cause == ptraceEventSeccomp:
