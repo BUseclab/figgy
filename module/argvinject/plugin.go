@@ -9,7 +9,7 @@ import (
 )
 
 type argvInject struct {
-	extraArgs []string
+	extraArgs  []string
 	removeArgs []string
 }
 
@@ -17,12 +17,38 @@ func (a *argvInject) Name() string {
 	return "argv-inject"
 }
 
+// looks for gcc/clang, g++/clang++, and cc
+func isTargetCompiler(path string) bool {
+	base := path
+	idx := strings.LastIndex(base, "/")
+	if idx != -1 {
+		base = base[idx+1:]
+	}
+
+	prefixes := []string{"gcc", "g++", "clang", "clang++", "cc", "c++"}
+	for _, p := range prefixes {
+		if base == p {
+			return true
+		}
+
+		// allow version suffix
+		if strings.HasPrefix(base, p+"-") {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
-	if (!strings.HasSuffix(call.Path, "cc") && !strings.HasSuffix(call.Path, "gcc")) {
+	if !isTargetCompiler(call.Path) {
 		return call, false
 	}
 
-	if (len(call.Argv) == 0) {
+	if len(call.Argv) == 0 {
+		return call, false
+	}
+
+	if len(call.Argv) > 1 && strings.HasPrefix(call.Argv[1], "-cc1") {
 		return call, false
 	}
 
@@ -33,12 +59,12 @@ func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
 	for _, a2 := range call.Argv {
 		remove := false
 		for _, r := range a.removeArgs {
-			if (a2 == r) {
+			if a2 == r {
 				remove = true
 				break
 			}
 		}
-		if (remove) {
+		if remove {
 			changed = true
 			continue
 		}
@@ -48,33 +74,33 @@ func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
 	// Injection: add extra args right after prog name unless already present
 	var toInject []string
 	for _, extra := range a.extraArgs {
-		if (extra == "") {
+		if extra == "" {
 			continue
 		}
-		
+
 		present := false
 		for _, a2 := range filteredArgv {
-			if (a2 == extra) {
+			if a2 == extra {
 				present = true
 				break
 			}
 		}
 
-		if (!present) {
+		if !present {
 			toInject = append(toInject, extra)
 		}
 	}
 
 	finalArgv := filteredArgv
-	if (len(toInject) > 0 && len(filteredArgv) > 0) {
+	if len(toInject) > 0 && len(filteredArgv) > 0 {
 		finalArgv = make([]string, 0, len(filteredArgv)+len(toInject))
-		finalArgv = append(finalArgv, filteredArgv[0])  // prog name
-		finalArgv = append(finalArgv, toInject...)  // new arg
+		finalArgv = append(finalArgv, filteredArgv[0]) // prog name
+		finalArgv = append(finalArgv, toInject...)     // new arg
 		finalArgv = append(finalArgv, filteredArgv[1:]...)
 		changed = true
 	}
 
-	if (!changed) {
+	if !changed {
 		return call, false
 	}
 
@@ -84,7 +110,28 @@ func (a *argvInject) Transform(call module.ExecCall) (module.ExecCall, bool) {
 
 func New() module.Interceptor {
 	return &argvInject{
-		// extraArgs: []string{"-Wall", "-g"},
-		removeArgs: []string{"-g", "-Wall"},
+		// llvm bitcode flags:
+		// extraArgs: []string{"-flto=full", "-ffat-lto-objects", "-Wl,-mllvm,-lto-embed-bitcode=optimized", "-fuse-ld=lld"},
+
+		// afl fuzzing flags (add to normal clang)
+		// extraArgs: []string{"-g", "-O2", "-fsanitize=fuzzer,address,undefined"},
+
+		extraArgs: []string{
+			"-fpass-plugin=/usr/lib/afl/afl-llvm-pass.so",
+			"-O3",
+			"-funroll-loops",
+			"-D__AFL_COMPILER=1",
+			"-D__AFL_HAVE_MANUAL_CONTROL=1",
+			"-fsanitize-coverage=trace-pc-guard",
+			"-fsanitize=fuzzer,address,undefined",
+			"-Wl../../../fuzzerWrapper.o",
+			// "-Wl,/usr/lib/afl/afl-compiler-rt.o",
+			"-g",
+			"-O2",
+		},
+
+		// extraArgs: []string{"-g", "-O2", "-fsanitize=fuzzer,address,undefined", "../../../fuzzerWrapper.cc", "-o fuzzerWrapper"},
+
+		// removeArgs: []string{"-g", "-Wall"},
 	}
 }

@@ -35,9 +35,6 @@ import (
 	"strings"
 	"syscall"
 
-	// "golang.org/x/net/bpf"
-	// "golang.org/x/sys/unix"
-
 	"interposer/module"
 )
 
@@ -50,11 +47,9 @@ const (
 
 const droppedExecPath = "/nonexistent-dropped-by-interposer"
 
-// const wrapperPath = "./execwrap"
-
 const (
 	ptraceOTraceSeccomp = 0x80
-	ptraceEventSeccomp = 7
+	ptraceEventSeccomp  = 7
 )
 
 var logLevel = new(slog.LevelVar)
@@ -80,13 +75,35 @@ func setupLogging() {
 
 // ======================================== start of STEP 1 FUNCTIONS ========================================  //
 
+type moduleListFlag struct {
+	paths []string
+}
+
+func (m *moduleListFlag) String() string {
+	if m == nil {
+		return ""
+	}
+	return strings.Join(m.paths, ",")
+}
+
+func (m *moduleListFlag) Set(value string) error {
+	for _, p := range strings.Split(value, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			m.paths = append(m.paths, p)
+		}
+	}
+	return nil
+}
+
 // parses the flags + commands (args) from the user command
-func parseArgs(args []string) (string, []string, bool, string, bool, bool) {
+func parseArgs(args []string) (string, []string, bool, []string, bool, bool) {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 
 	modeFlag := fs.String("mode", ModeNoModify, "exec modes: modify | nomodify | nomodify-drop")
 	debugFlag := fs.Bool("debug", false, "verbose logging (debug and up). Default logs errors only")
-	moduleFlag := fs.String("module", "", "path to a compiled .so module implementing module.Interceptor")
+	var moduleFlag moduleListFlag
+	fs.Var(&moduleFlag, "module", "path to a compiled .so module implementing module.Interceptor")
 	seccompFlag := fs.Bool("seccomp", false, "use a seccomp-BPF filter for execve syscalls")
 
 	fs.Usage = func() {
@@ -96,22 +113,22 @@ func parseArgs(args []string) (string, []string, bool, string, bool, bool) {
 
 	err := fs.Parse(args)
 	if err != nil {
-		return "", nil, false, "", false, false
+		return "", nil, false, nil, false, false
 	}
 
 	if *modeFlag != ModeModify && *modeFlag != ModeNoModify && *modeFlag != ModeNoModifyDrop {
 		fmt.Fprintf(os.Stderr, "invalid --mode %q\n", *modeFlag)
 		fs.Usage()
-		return "", nil, false, "", false, false
+		return "", nil, false, nil, false, false
 	}
 
 	command := fs.Args()
 	if len(command) == 0 {
 		fs.Usage()
-		return "", nil, false, "", false, false
+		return "", nil, false, nil, false, false
 	}
 
-	return *modeFlag, command, *debugFlag, *moduleFlag, *seccompFlag, true
+	return *modeFlag, command, *debugFlag, moduleFlag.paths, *seccompFlag, true
 }
 
 func resolveWrapperPath() (string, error) {
@@ -119,7 +136,7 @@ func resolveWrapperPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolving own executable path: %w", err)
 	}
-	
+
 	real, err := filepath.EvalSymlinks(exe)
 	if err != nil {
 		real = exe
@@ -193,12 +210,12 @@ func readAndCountStringArray(pid int, addr uintptr) ([]string, int) {
 }
 
 func resolveTraceePath(pid int, path string) string {
-	if (filepath.IsAbs(path)) {
+	if filepath.IsAbs(path) {
 		return path
 	}
 
 	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
-	if (err != nil) {
+	if err != nil {
 		return path
 	}
 
@@ -206,10 +223,10 @@ func resolveTraceePath(pid int, path string) string {
 }
 
 func IsSetUidBinary(pid int, path string) (bool, error) {
-	info, err := os.Stat(resolveTraceePath(pid, path))  // needs superuser perms to check file info
-	if (err != nil) {
-		if (os.IsNotExist(err)) {
-			return false, nil	
+	info, err := os.Stat(resolveTraceePath(pid, path)) // needs superuser perms to check file info
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
 		}
 		return false, err
 	}
@@ -334,6 +351,120 @@ func argvEqual(a, b []string) bool {
 	return true
 }
 
+// START OF SCRATCH MEMORY FUNCTIONS
+
+const (
+	sysMmap        = 9
+	protReadWrite  = 0x3
+	mapPrivateAnon = 0x22
+	pageSize       = 4096
+)
+
+func injectMmap(pid int, regs *syscall.PtraceRegs, size uintptr) (uintptr, bool) {
+	// save original registers
+	origNr := regs.Orig_rax
+	origRdi, origRsi, origRdx := regs.Rdi, regs.Rsi, regs.Rdx
+	origR10, origR8, origR9 := regs.R10, regs.R8, regs.R9
+	origRip := regs.Rip
+
+	// round requested size to 4096 bytes
+	allocSize := (size + pageSize - 1) &^ (pageSize - 1)
+	if allocSize == 0 {
+		allocSize = pageSize
+	}
+
+	// format new registers according to x86_64 linux calling conventions
+	mmapRegs := *regs
+	mmapRegs.Orig_rax = sysMmap
+	mmapRegs.Rax = sysMmap
+	mmapRegs.Rdi = 0                 // addr = NULL --> kernel pikcs
+	mmapRegs.Rsi = uint64(allocSize) // len
+	mmapRegs.Rdx = protReadWrite     // prot
+	mmapRegs.R10 = mapPrivateAnon    // flags
+	mmapRegs.R8 = ^uint64(0)         // fd = -1
+	mmapRegs.R9 = 0                  // offset
+
+	// write mmap to cpu registers
+	err := syscall.PtraceSetRegs(pid, &mmapRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to set regs for mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	// resumes syscall --> pause at mmap syscall
+	err = syscall.PtraceSyscall(pid, 0)
+	if err != nil {
+		slog.Error("injectMmap: failed to step into mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	var status syscall.WaitStatus
+	wpid, err := syscall.Wait4(pid, &status, 0, nil)
+	if err != nil || wpid != pid {
+		slog.Error("injectMmap: wait4 for mmap exit failed", "pid", pid, "err", err)
+		return 0, false
+	}
+	if status.Exited() || status.Signaled() {
+		slog.Error("injectMmap: tracee died during mmap injection", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	var afterRegs syscall.PtraceRegs
+	err = syscall.PtraceGetRegs(pid, &afterRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to read regs after mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	ret := int64(afterRegs.Rax)
+	if ret < 0 && ret > -4096 { // neg code = err
+		slog.Error("injectMmap: mmap failed inside tracee", "pid", pid, "err", err)
+		return 0, false
+	}
+	scratchAddr := uintptr(ret)
+
+	// need to move instruciton ptr back 2 steps (size of acc x86 syscall) so target cont exec code as before
+	afterRegs.Rip = origRip - 2
+	afterRegs.Orig_rax = origNr
+	afterRegs.Rax = origNr
+	afterRegs.Rdi = origRdi
+	afterRegs.Rsi = origRsi
+	afterRegs.Rdx = origRdx
+	afterRegs.R10 = origR10
+	afterRegs.R8 = origR8
+	afterRegs.R9 = origR9
+
+	// restore og regs
+	err = syscall.PtraceSetRegs(pid, &afterRegs)
+	if err != nil {
+		slog.Error("injectMmap: failed to restore regs post-mmap", "pid", pid, "err", err)
+		return 0, false
+	}
+
+	*regs = afterRegs
+	return scratchAddr, true
+}
+
+// computers bytes needed for path + argv strings (8 byte padded) + argv ptr table
+func execScratchSize(path string, argv []string) uintptr {
+	pad8 := func(n int) uintptr {
+		p := uintptr(n)
+		if p%8 != 0 {
+			p += 8 - (p % 8)
+		}
+		return p
+	}
+
+	size := pad8(len(path) + 1) // path str
+	for _, s := range argv {    // arg strs
+		size += pad8(len(s) + 1)
+	}
+	size += uintptr(len(argv)+1) * 8 // NULL terminated ptr table
+	return size
+}
+
+// END OF SCRATCH MEMORY FUNCTIONS
+
 // overwrites pathname (Rdi) arg of execve so tracee execs a diff binary
 // argv/envp (Rsi/Rdx) not edited --> replacement sees same invocation context
 func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
@@ -360,23 +491,44 @@ func redirectExecve(pid int, regs *syscall.PtraceRegs, newPath string) bool {
 
 // MODIFY MODE ONLY - modifies tracee's own og execve syscall args/path
 func applyExecCallPatch(pid int, regs *syscall.PtraceRegs, orig, updated module.ExecCall) bool {
-	if orig.Path != updated.Path {
-		// overwrites path
-		if !redirectExecve(pid, regs, updated.Path) {
-			return false
-		}
-	}
+	pathChanged := orig.Path != updated.Path
+	argvChanged := !argvEqual(orig.Argv, updated.Argv)
 
-	if argvEqual(orig.Argv, updated.Argv) {
+	if !pathChanged && !argvChanged {
 		return true
 	}
 
-	// modifies argv (same/more/less argv)
-	if len(orig.Argv) == len(updated.Argv) {
-		return patchArgvVectorInPlace(pid, regs, orig, updated)
+	needed := execScratchSize(updated.Path, updated.Argv)
+	scratch, ok := injectMmap(pid, regs, needed)
+	if !ok {
+		slog.Error("failed to allocate scratch memory in tracee for exec patch", "pid", pid)
+		return false
 	}
 
-	return rebuildArgvTable(pid, regs, updated)
+	pathAddr := scratch
+	if !writeCString(pid, pathAddr, updated.Path) {
+		slog.Error("failed to write patched path", "pid", pid)
+		return false
+	}
+	pathSize := uintptr(len(updated.Path) + 1)
+	if pathSize%8 != 0 {
+		pathSize += 8 - (pathSize % 8)
+	}
+
+	argvTableAddr, ok := writeStringArray(pid, scratch+pathSize, updated.Argv)
+	if !ok {
+		slog.Error("failed to write patched argv", "pid", pid)
+		return false
+	}
+
+	regs.Rdi = uint64(pathAddr)
+	regs.Rsi = uint64(argvTableAddr)
+	err := syscall.PtraceSetRegs(pid, regs)
+	if err != nil {
+		slog.Error("failed to set regs for exec patch", "pid", pid, "err", err)
+		return false
+	}
+	return true
 }
 
 // directly edits argv in og execve cmd (only works w/ same # of argv args)
@@ -385,10 +537,6 @@ func patchArgvVectorInPlace(pid int, regs *syscall.PtraceRegs, orig, updated mod
 	offset := uintptr(0)
 
 	for i := range updated.Argv {
-		if orig.Argv[i] == updated.Argv[i] {
-			continue
-		}
-
 		addr := scratchBase + offset
 		if !writeCString(pid, addr, updated.Argv[i]) {
 			slog.Error("failed to write patched argv string", "pid", pid, "index", i)
@@ -444,31 +592,42 @@ func loadModule(path string) (module.Interceptor, error) {
 	if !ok {
 		return nil, fmt.Errorf("module New() has wrong signature, expected func() module.Interceptor")
 	}
-	
+
 	return newFn(), nil
 }
 
-func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptor module.Interceptor) (bool) {
+func loadModules(paths []string) ([]module.Interceptor, error) {
+	interceptors := make([]module.Interceptor, 0, len(paths))
+	for _, path := range paths {
+		interceptor, err := loadModule(path)
+		if err != nil {
+			return nil, fmt.Errorf("loading module %s: %w", path, err)
+		}
+		interceptors = append(interceptors, interceptor)
+	}
+	return interceptors, nil
+}
+
+func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptors []module.Interceptor) bool {
 	path := readCString(pid, uintptr(regs.Rdi))
 
 	// checks if program is a setuid binary, if it is then detach ptracer
 	isSetuid, err := IsSetUidBinary(pid, path)
-	if (err != nil || isSetuid) {
-		if (err != nil) {
+	if err != nil || isSetuid {
+		if err != nil {
 			slog.Error("failed to check setuid bit", "pid", pid, "path", path, "err", err)
 		} else {
 			slog.Info("detaching from setuid tracee", "pid", pid)
 			detachErr := syscall.PtraceDetach(pid)
-			if (detachErr != nil) {
+			if detachErr != nil {
 				slog.Error("failed to detach from setuid tracee", "pid", pid, "err", detachErr)
 			}
-			return true  // skips step 4
+			return true // skips step 4
 		}
 	}
 
 	argv, _ := readAndCountStringArray(pid, uintptr(regs.Rsi))
 	envv, envc := readAndCountStringArray(pid, uintptr(regs.Rdx))
-
 
 	slog.Info("execve",
 		"proc", procName(pid),
@@ -487,15 +646,24 @@ func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptor mo
 	changed := false
 
 	// switch modules
-	if interceptor != nil {
-		newCall, ch := interceptor.Transform(orig)
+	for _, interceptor := range interceptors {
+		if interceptor == nil {
+			continue
+		}
 
+		newCall, ch := interceptor.Transform(updated)
 		if ch {
+			slog.Debug("module transformed exec call",
+				"pid", pid,
+				"module", interceptor.Name(),
+				"path", newCall.Path,
+				"argv", newCall.Argv,
+			)
 			updated = newCall
 			changed = true
 		}
 	}
-	
+
 	if changed {
 		switch mode {
 		case ModeModify:
@@ -522,7 +690,7 @@ func handleExecve(pid int, regs *syscall.PtraceRegs, mode string, interceptor mo
 					slog.Error("PATCH MISMATCH: argv", "pid", pid, "got", verifyArgv, "want", updated.Argv)
 				}
 			}
-			
+
 		case ModeNoModify:
 			slog.Info("nomodify: running modified cmd alongside og execve", "pid", pid)
 			// everytime thers a ModeNoModify cmd, duplicate the cmd then modify it
@@ -569,7 +737,6 @@ func main() {
 	}
 	slog.Debug("pasted args", "mode", mode, "command", command, "debug", debug, "module", modulePath)
 
-
 	var wrapperPath string
 	if seccomp {
 		var err error
@@ -586,16 +753,18 @@ func main() {
 		}
 	}
 
-	var interceptor module.Interceptor
-	if modulePath != "" {
+	var interceptor []module.Interceptor
+	if len(modulePath) > 0 {
 		var err error
-		interceptor, err = loadModule(modulePath)
+		interceptor, err = loadModules(modulePath)
 
 		if err != nil {
 			slog.Error("failed to load module", "path", modulePath, "err", err)
 			return
 		}
-		slog.Info("loaded module", "name", interceptor.Name())
+		for _, interceptor := range interceptor {
+			slog.Info("loaded module", "name", interceptor.Name())
+		}
 	}
 
 	runtime.LockOSThread() // pin go tracer to 1 program thread (req.)
@@ -657,27 +826,27 @@ func main() {
 		pid, err := syscall.Wait4(-1, &status, 0, nil)
 
 		stopCount++
-		
+
 		if err != nil { // traced all processes inc. fork/clone
 			slog.Info("No traced processes left")
 			break
 		}
-		
+
 		if status.Exited() || status.Signaled() { // cur pid died/ended/exited -> cont. to next
 			slog.Debug("traced process exited", "proc", procName(pid), "pid", pid)
 			continue
 		}
-		
+
 		sig := status.StopSignal()
 		cause := status.TrapCause()
-		
+
 		// ############################## STEP 3. Parse execve args 3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3-3 THREE THREE THREE THREE THREE THREE
-		
+
 		// numExecve++
 		switch {
 		// with seccomp
 		case seccomp && cause == ptraceEventSeccomp:
-    		slog.Debug("seccomp-trapped execve", "pid", pid)
+			slog.Debug("seccomp-trapped execve", "pid", pid)
 			if syscall.PtraceGetRegs(pid, &regs) == nil && (regs.Orig_rax == 59 || regs.Orig_rax == 322) {
 				detached := handleExecve(pid, &regs, mode, interceptor)
 				if detached {
@@ -685,7 +854,7 @@ func main() {
 				}
 			}
 			syscall.PtraceCont(pid, 0)
-		
+
 		// without seccomp
 		case !seccomp && sig == syscall.SIGTRAP|0x80:
 			if syscall.PtraceGetRegs(pid, &regs) == nil {
@@ -697,30 +866,29 @@ func main() {
 				}
 			}
 			syscall.PtraceSyscall(pid, 0)
-			
+
 		case cause != -1:
 			if seccomp {
 				syscall.PtraceCont(pid, 0)
 			} else {
 				syscall.PtraceSyscall(pid, 0)
 			}
-				
+
 		case sig == syscall.SIGTRAP || sig == syscall.SIGSTOP:
 			if seccomp {
 				syscall.PtraceCont(pid, 0)
 			} else {
 				syscall.PtraceSyscall(pid, 0)
 			}
-				
+
 		default:
 			if seccomp {
 				syscall.PtraceCont(pid, int(sig))
 			} else {
 				syscall.PtraceSyscall(pid, int(sig))
 			}
-			}
 		}
+	}
 	slog.Info("total ptrace stops", "count", stopCount)
 	slog.Info("Num execve calls", "calls", numExecve)
 }
-			

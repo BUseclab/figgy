@@ -10,9 +10,9 @@ tests/*
 wrapper/*
 !main.go
 !README.md
-!Makefile
+!Makefile*
 !go.mod
 !go.sum
 !LICENSE
 !*.sh
-!*.txt
+!targets.txt
