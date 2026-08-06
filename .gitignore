@@ -1,18 +1,2 @@
-# ignore everything
-*
-
-# do not ignore the .gitignore file itself
-!.gitignore
-
-# Allow specific files explicitly
-module/*
-tests/*
-wrapper/*
-!main.go
-!README.md
-!Makefile*
-!go.mod
-!go.sum
-!LICENSE
-!*.sh
-!targets.txt
+todo.txt
+runFuzzPkg.sh
