@@ -1,30 +1,30 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"log/slog"
 
 	"interposer/module"
 )
 
 // compiler-driver subprocess stages that should NOT be rewritten
 var skipBasenames = map[string]bool{
-	"cc1": true,
-	"cc1plus": true,
-	"collect2": true,
-	"as": true,
-	"ld": true,
-	"ld.bfd": true,
-	"ld.gold": true,
-	"lto1": true,
+	"cc1":         true,
+	"cc1plus":     true,
+	"collect2":    true,
+	"as":          true,
+	"ld":          true,
+	"ld.bfd":      true,
+	"ld.gold":     true,
+	"lto1":        true,
 	"lto-wrapper": true,
 }
 
 type compilerSwap struct {
-	resolvedCC string
+	resolvedCC  string
 	resolvedCXX string
 }
 
@@ -33,16 +33,16 @@ func (m *compilerSwap) Name() string {
 }
 
 // exact match compiler-driver names
-var cxxBasenames = map[string]bool {
+var cxxBasenames = map[string]bool{
 	"g++": true,
 	"c++": true,
-	//"clang++": true,
+	// "clang++": true,
 }
 
-var ccBasenames = map[string]bool {
+var ccBasenames = map[string]bool{
 	"gcc": true,
-	"cc": true,
-	//"clang": true,
+	"cc":  true,
+	// "clang": true,
 }
 
 // strips trailing "-version" suffix (e.g. gcc-14 --> gcc)
@@ -129,8 +129,8 @@ func New() module.Interceptor {
 		slog.Warn("could not resolve CXX swap target", "target", cxxTarget, "err", err)
 	}
 
-	return &compilerSwap {
-		resolvedCC: resolvedCC,
+	return &compilerSwap{
+		resolvedCC:  resolvedCC,
 		resolvedCXX: resolvedCXX,
 	}
 }

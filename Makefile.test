@@ -1,7 +1,5 @@
 CC ?= gcc
-CFLAGS = -Wall -g
-# CFLAGS = -g
-# CFLAGS = 
+CFLAGS = -g
 TARGETS = hello_exe
 
 .PHONY: all clean test help
