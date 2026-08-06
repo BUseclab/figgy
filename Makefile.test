@@ -1,13 +1,7 @@
-CC ?= gcc
-CFLAGS = -g
-TARGETS = hello_exe
+.PHONY: all clean
 
-.PHONY: all clean test help
-
-all: $(TARGETS)
-
-hello_exe: tests/hello.c
-	$(CC) $(CFLAGS) -o hello_exe tests/hello.c
+%.o: tests/%.c
+	gcc -O2 -Wall -Wextra -c -o $@ $<
 
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f *.o
